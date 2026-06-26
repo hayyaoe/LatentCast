@@ -40,7 +40,7 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     private let maxHistoryLength = 60    // ~1s of frames at 30fps
     private let trackingThreshold: CGFloat = 0.15 // Centroid distance threshold
     private let trackTimeout: TimeInterval = 1.5   // Delete track if inactive for > 1.5s
-    private let speakThreshold: Double = 0.003   // Variance above this = speaking
+    private let speakThreshold: Double = 0.0003   // Variance above this = speaking
     
     nonisolated func processFrame(_ sendableBuffer: SendablePixelBuffer) {
         visionQueue.async {
