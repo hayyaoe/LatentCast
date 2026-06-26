@@ -195,6 +195,45 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
                 
+                // Audio Level VU Meter (shown when session is active)
+                if captureEngine.isSessionRunning {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Microphone Level")
+                                .font(.system(.caption2, design: .monospaced))
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: "%.1f %%", captureEngine.audioLevel * 100))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.green)
+                        }
+                        
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(Color.black.opacity(0.3))
+                                    .frame(height: 6)
+                                
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [.green, .yellow, .red],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                    .frame(width: CGFloat(captureEngine.audioLevel) * geo.size.width, height: 6)
+                            }
+                        }
+                        .frame(height: 6)
+                    }
+                    .padding(10)
+                    .background(Color.white.opacity(0.05))
+                    .cornerRadius(8)
+                    .transition(.opacity.combined(with: .scale))
+                }
+                
                 // Live Console Area
                 VStack(alignment: .leading, spacing: 6) {
                     Text("LIVE CONSOLE")
@@ -248,6 +287,18 @@ struct ContentView: View {
             captureEngine.frameHandler.setCallback { [weak faceEngine] sendableBuffer in
                 faceEngine?.processFrame(sendableBuffer)
             }
+            
+            // Set up audio callback to validate audio ingestion without flooding the logs
+            let printer = ThrottledPrinter(limit: 100)
+            captureEngine.audioHandler.setCallback { samples in
+                if printer.shouldPrint() {
+                    let maxVal = samples.map(abs).max() ?? 0.0
+                    Task { @MainActor in
+                        appendLog("[Audio] Captured \(samples.count) samples. Peak amplitude: \(String(format: "%.4f", maxVal))")
+                    }
+                }
+            }
+            
             appendLog("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
             appendLog("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
         }
@@ -420,5 +471,27 @@ struct LandmarksMeshView: View {
             x: point.x * size.width,
             y: (1.0 - point.y) * size.height
         )
+    }
+}
+
+// Thread-safe counter class for throttling print statements in concurrently-executing callbacks
+private final class ThrottledPrinter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private let limit: Int
+    
+    init(limit: Int) {
+        self.limit = limit
+    }
+    
+    func shouldPrint() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        if count >= limit {
+            count = 0
+            return true
+        }
+        return false
     }
 }
