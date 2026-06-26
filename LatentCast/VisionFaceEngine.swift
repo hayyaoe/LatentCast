@@ -41,7 +41,21 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     private let maxHistoryLength = 60    // ~1s of frames at 30fps
     private let trackingThreshold: CGFloat = 0.15 // Centroid distance threshold
     private let trackTimeout: TimeInterval = 1.5   // Delete track if inactive for > 1.5s
-    private let speakThreshold: Double = 0.0003   // Variance above this = speaking
+    private var speakThresholdInternal: Double = 0.0003   // Variance above this = speaking
+    
+    // Thread-safe public property for adjusting sensitivity from the UI
+    var speakThreshold: Double {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return speakThresholdInternal
+        }
+        set {
+            lock.lock()
+            speakThresholdInternal = newValue
+            lock.unlock()
+        }
+    }
     
     // Thread-safe access to current tracked faces (for audio processing queue)
     var safeActiveTracks: [ActiveFaceInfo] {
@@ -149,7 +163,7 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
             
             // 4. Calculate temporal lip variance
             let variance = calculateVariance(rollingHeights)
-            let isSpeaking = variance > speakThreshold
+            let isSpeaking = variance > speakThresholdInternal
             
             var landmarksDict: [String: [CGPoint]] = [:]
             if let leftEye = landmarks.leftEye {

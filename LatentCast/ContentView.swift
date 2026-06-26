@@ -16,6 +16,11 @@ struct ContentView: View {
     @StateObject private var pythonBridge = PythonBridge()
     @State private var logs: [String] = ["[Idle] Ready. Waiting for user interaction."]
     
+    // Configurable thresholds for Heuristic Fusion Tuning
+    @State private var faceEngineSpeakThreshold: Double = 0.0003
+    @State private var pythonBridgeFusionThreshold: Double = 0.00010
+    @State private var pythonBridgeSilenceTimeout: Double = 600.0
+    
     var body: some View {
         HStack(spacing: 20) {
             // Left Column: Camera Preview + Face Tracking Overlay
@@ -236,6 +241,65 @@ struct ContentView: View {
                     .transition(.opacity.combined(with: .scale))
                 }
                 
+                // Sensitivity & Threshold Tuning Panel
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("THRESHOLD TUNING")
+                        .font(.system(.caption2, design: .monospaced))
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+                    
+                    // 1. Face Speak Threshold Slider
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Face Speak")
+                                .font(.caption2)
+                            Spacer()
+                            Text(String(format: "%.5f", faceEngineSpeakThreshold))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.purple)
+                        }
+                        Slider(value: $faceEngineSpeakThreshold, in: 0.00005...0.00200, step: 0.00005)
+                            .onChange(of: faceEngineSpeakThreshold) {
+                                faceEngine.speakThreshold = faceEngineSpeakThreshold
+                            }
+                    }
+                    
+                    // 2. Fusion Threshold Slider
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Fusion")
+                                .font(.caption2)
+                            Spacer()
+                            Text(String(format: "%.5f", pythonBridgeFusionThreshold))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.purple)
+                        }
+                        Slider(value: $pythonBridgeFusionThreshold, in: 0.00001...0.00100, step: 0.00001)
+                            .onChange(of: pythonBridgeFusionThreshold) {
+                                pythonBridge.updateParameters(silenceTimeoutMs: pythonBridgeSilenceTimeout, fusionThreshold: pythonBridgeFusionThreshold)
+                            }
+                    }
+                    
+                    // 3. Silence Timeout Slider
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Silence (ms)")
+                                .font(.caption2)
+                            Spacer()
+                            Text(String(format: "%.0f ms", pythonBridgeSilenceTimeout))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.purple)
+                        }
+                        Slider(value: $pythonBridgeSilenceTimeout, in: 200...2000, step: 50)
+                            .onChange(of: pythonBridgeSilenceTimeout) {
+                                pythonBridge.updateParameters(silenceTimeoutMs: pythonBridgeSilenceTimeout, fusionThreshold: pythonBridgeFusionThreshold)
+                            }
+                    }
+                }
+                .padding(10)
+                .background(Color.white.opacity(0.04))
+                .cornerRadius(8)
+                
                 // Python Diagnostics Panel
                 VStack(alignment: .leading, spacing: 8) {
                     Text("PYTHON DIAGNOSTICS")
@@ -336,6 +400,10 @@ struct ContentView: View {
             captureEngine.frameHandler.setCallback { [weak faceEngine] sendableBuffer in
                 faceEngine?.processFrame(sendableBuffer)
             }
+            
+            // Apply initial thresholds
+            faceEngine.speakThreshold = faceEngineSpeakThreshold
+            pythonBridge.updateParameters(silenceTimeoutMs: pythonBridgeSilenceTimeout, fusionThreshold: pythonBridgeFusionThreshold)
             
             // Route audio samples to Python VAD & transcription engine
             let printer = ThrottledPrinter(limit: 100)

@@ -16,6 +16,8 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     @Published var isProcessing: Bool = false
     @Published var liveTranscription: String = ""
     @Published var isVoiceActive: Bool = false
+    @Published var silenceTimeoutMs: Double = 600.0
+    @Published var fusionThreshold: Double = 0.00010
     
     private var pyEngine: PythonObject?
     private let pythonQueue = DispatchQueue(label: "com.latentcast.pythonQueue", qos: .userInitiated)
@@ -163,6 +165,23 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
             
             Task { @MainActor in
                 self.lastResponse = response
+            }
+        }
+    }
+    
+    /// Dynamically updates silence timeout and lip variance fusion threshold in the Python engine
+    func updateParameters(silenceTimeoutMs: Double, fusionThreshold: Double) {
+        pythonQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            guard let engine = self.pyEngine else {
+                self.lock.unlock()
+                return
+            }
+            self.lock.unlock()
+            
+            self.withGIL {
+                _ = engine.update_fusion_parameters(silenceTimeoutMs, fusionThreshold)
             }
         }
     }
