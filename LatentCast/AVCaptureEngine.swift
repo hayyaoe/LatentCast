@@ -21,6 +21,7 @@ class AVCaptureEngine: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "com.latentcast.sessionQueue", qos: .userInitiated)
     private let videoQueue = DispatchQueue(label: "com.latentcast.videoQueue", qos: .userInitiated)
     private var videoDelegate: VideoDelegate?
+    nonisolated let frameHandler = FrameHandler()
     
     override init() {
         super.init()
@@ -62,13 +63,19 @@ class AVCaptureEngine: NSObject, ObservableObject {
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) // NV12
             ]
             
-            let delegate = VideoDelegate { [weak self] calculatedFPS, totalFrames in
-                guard let self = self else { return }
-                Task { @MainActor in
-                    self.fps = calculatedFPS
-                    self.lastLog = "[Camera] Captured \(totalFrames) frames (FPS: \(String(format: "%.1f", calculatedFPS)))"
+            let delegate = VideoDelegate(
+                onFPSUpdated: { [weak self] calculatedFPS, totalFrames in
+                    guard let self = self else { return }
+                    Task { @MainActor in
+                        self.fps = calculatedFPS
+                        self.lastLog = "[Camera] Captured \(totalFrames) frames (FPS: \(String(format: "%.1f", calculatedFPS)))"
+                    }
+                },
+                onFrameCaptured: { [weak self] sendableBuffer in
+                    guard let self = self else { return }
+                    self.frameHandler.handle(sendableBuffer)
                 }
-            }
+            )
             
             self.videoOutput.setSampleBufferDelegate(delegate, queue: self.videoQueue)
             
@@ -118,5 +125,24 @@ class AVCaptureEngine: NSObject, ObservableObject {
             self.lastLog = message
             print("[AVCaptureEngine] \(message)")
         }
+    }
+}
+
+// Thread-safe frame callback router
+class FrameHandler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: (@Sendable (SendablePixelBuffer) -> Void)?
+    
+    func setCallback(_ callback: @escaping @Sendable (SendablePixelBuffer) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.callback = callback
+    }
+    
+    func handle(_ frame: SendablePixelBuffer) {
+        lock.lock()
+        let currentCallback = self.callback
+        lock.unlock()
+        currentCallback?(frame)
     }
 }

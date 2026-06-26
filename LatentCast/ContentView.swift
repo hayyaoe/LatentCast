@@ -12,11 +12,12 @@ import Combine
 struct ContentView: View {
     @StateObject private var permissionManager = PermissionManager()
     @StateObject private var captureEngine = AVCaptureEngine()
+    @StateObject private var faceEngine = VisionFaceEngine()
     @State private var logs: [String] = ["[Idle] Ready. Waiting for user interaction."]
     
     var body: some View {
         HStack(spacing: 20) {
-            // Left Column: Camera Preview
+            // Left Column: Camera Preview + Face Tracking Overlay
             VStack {
                 if captureEngine.isSessionRunning {
                     CameraPreview(session: captureEngine.session)
@@ -25,6 +26,49 @@ struct ContentView: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .overlay(
+                            GeometryReader { geometry in
+                                ForEach(faceEngine.activeTracks) { track in
+                                    let bbox = track.boundingBox
+                                    let w = bbox.size.width * geometry.size.width
+                                    let h = bbox.size.height * geometry.size.height
+                                    let x = bbox.origin.x * geometry.size.width + w / 2
+                                    let y = (1.0 - bbox.origin.y - bbox.size.height) * geometry.size.height + h / 2
+                                    
+                                    // Bounding Box outline (neon green if speaking, white translucent if silent)
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(track.isActiveSpeaker ? Color.green : Color.white.opacity(0.4), lineWidth: track.isActiveSpeaker ? 3.0 : 1.5)
+                                        .frame(width: w, height: h)
+                                        .shadow(color: track.isActiveSpeaker ? Color.green.opacity(0.5) : Color.clear, radius: 6)
+                                        .overlay(
+                                            LandmarksMeshView(
+                                                landmarks: track.landmarks,
+                                                color: track.isActiveSpeaker ? Color.green.opacity(0.7) : Color.white.opacity(0.4)
+                                            )
+                                        )
+                                        .position(x: x, y: y)
+                                        .overlay(
+                                            // Label overlayed above the box
+                                            Group {
+                                                if track.isActiveSpeaker {
+                                                    HStack(spacing: 4) {
+                                                        Image(systemName: "waveform.and.mic")
+                                                            .symbolEffect(.bounce, options: .repeating)
+                                                        Text("SPEAKING")
+                                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                                    }
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 3)
+                                                    .background(Color.green)
+                                                    .foregroundColor(.black)
+                                                    .cornerRadius(4)
+                                                    .position(x: x, y: y - (h / 2) - 14)
+                                                }
+                                            }
+                                        )
+                                }
+                            }
                         )
                         .overlay(
                             HStack {
@@ -111,6 +155,7 @@ struct ContentView: View {
                         withAnimation {
                             if captureEngine.isSessionRunning {
                                 captureEngine.stopSession()
+                                faceEngine.activeTracks = []
                             } else {
                                 captureEngine.startSession()
                             }
@@ -191,16 +236,27 @@ struct ContentView: View {
         )
         .onReceive(captureEngine.$lastLog) { logMsg in
             if !logMsg.isEmpty {
-                logs.append(logMsg)
-                // Limit log size to last 50 entries
-                if logs.count > 50 {
-                    logs.removeFirst()
-                }
+                appendLog(logMsg)
+            }
+        }
+        .onReceive(faceEngine.$lastLog) { logMsg in
+            if !logMsg.isEmpty {
+                appendLog(logMsg)
             }
         }
         .onAppear {
-            logs.append("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
-            logs.append("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
+            captureEngine.frameHandler.setCallback { [weak faceEngine] sendableBuffer in
+                faceEngine?.processFrame(sendableBuffer)
+            }
+            appendLog("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
+            appendLog("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
+        }
+    }
+    
+    private func appendLog(_ message: String) {
+        logs.append(message)
+        if logs.count > 50 {
+            logs.removeFirst()
         }
     }
     
@@ -317,4 +373,52 @@ class PermissionManager: ObservableObject {
 
 #Preview {
     ContentView()
+}
+
+struct LandmarksMeshView: View {
+    let landmarks: [String: [CGPoint]]
+    let color: Color
+    
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            
+            Path { path in
+                for (key, points) in landmarks {
+                    guard !points.isEmpty else { continue }
+                    
+                    let firstPt = mapPoint(points[0], to: size)
+                    path.move(to: firstPt)
+                    
+                    for i in 1..<points.count {
+                        path.addLine(to: mapPoint(points[i], to: size))
+                    }
+                    
+                    if key.contains("Eye") || key.contains("Lips") {
+                        path.closeSubpath()
+                    }
+                }
+            }
+            .stroke(color, lineWidth: 1.0)
+            
+            ForEach(Array(landmarks.keys), id: \.self) { key in
+                if let points = landmarks[key] {
+                    ForEach(0..<points.count, id: \.self) { index in
+                        let pt = mapPoint(points[index], to: size)
+                        Circle()
+                            .fill(color)
+                            .frame(width: 2.0, height: 2.0)
+                            .position(pt)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func mapPoint(_ point: CGPoint, to size: CGSize) -> CGPoint {
+        return CGPoint(
+            x: point.x * size.width,
+            y: (1.0 - point.y) * size.height
+        )
+    }
 }
