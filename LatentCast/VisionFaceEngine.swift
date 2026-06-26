@@ -37,10 +37,18 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     
     // Internal tracking parameters (protected by lock)
     private var tracks: [FaceTrack] = []
+    private var safeTracksCache: [ActiveFaceInfo] = []
     private let maxHistoryLength = 60    // ~1s of frames at 30fps
     private let trackingThreshold: CGFloat = 0.15 // Centroid distance threshold
     private let trackTimeout: TimeInterval = 1.5   // Delete track if inactive for > 1.5s
     private let speakThreshold: Double = 0.0003   // Variance above this = speaking
+    
+    // Thread-safe access to current tracked faces (for audio processing queue)
+    var safeActiveTracks: [ActiveFaceInfo] {
+        lock.lock()
+        defer { lock.unlock() }
+        return safeTracksCache
+    }
     
     nonisolated func processFrame(_ sendableBuffer: SendablePixelBuffer) {
         visionQueue.async {
@@ -179,6 +187,9 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
                 )
             )
         }
+        
+        // Update thread-safe cache
+        self.safeTracksCache = currentFrameInfos
         
         // 5. Publish snapshot back to UI on MainActor
         let tracksSnapshot = currentFrameInfos

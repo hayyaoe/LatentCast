@@ -31,43 +31,7 @@ struct ContentView: View {
                         .overlay(
                             GeometryReader { geometry in
                                 ForEach(faceEngine.activeTracks) { track in
-                                    let bbox = track.boundingBox
-                                    let w = bbox.size.width * geometry.size.width
-                                    let h = bbox.size.height * geometry.size.height
-                                    let x = bbox.origin.x * geometry.size.width + w / 2
-                                    let y = (1.0 - bbox.origin.y - bbox.size.height) * geometry.size.height + h / 2
-                                    
-                                    // Bounding Box outline (neon green if speaking, white translucent if silent)
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(track.isActiveSpeaker ? Color.green : Color.white.opacity(0.4), lineWidth: track.isActiveSpeaker ? 3.0 : 1.5)
-                                        .frame(width: w, height: h)
-                                        .shadow(color: track.isActiveSpeaker ? Color.green.opacity(0.5) : Color.clear, radius: 6)
-                                        .overlay(
-                                            LandmarksMeshView(
-                                                landmarks: track.landmarks,
-                                                color: track.isActiveSpeaker ? Color.green.opacity(0.7) : Color.white.opacity(0.4)
-                                            )
-                                        )
-                                        .position(x: x, y: y)
-                                        .overlay(
-                                            // Label overlayed above the box
-                                            Group {
-                                                if track.isActiveSpeaker {
-                                                    HStack(spacing: 4) {
-                                                        Image(systemName: "waveform.and.mic")
-                                                            .symbolEffect(.bounce, options: .repeating)
-                                                        Text("SPEAKING")
-                                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                                    }
-                                                    .padding(.horizontal, 6)
-                                                    .padding(.vertical, 3)
-                                                    .background(Color.green)
-                                                    .foregroundColor(.black)
-                                                    .cornerRadius(4)
-                                                    .position(x: x, y: y - (h / 2) - 14)
-                                                }
-                                            }
-                                        )
+                                    FaceTrackOverlayView(track: track, geometrySize: geometry.size)
                                 }
                             }
                         )
@@ -91,6 +55,22 @@ struct ContentView: View {
                             .cornerRadius(6)
                             .padding(8),
                             alignment: .top
+                        )
+                        .overlay(
+                            Group {
+                                if !pythonBridge.liveTranscription.isEmpty {
+                                    Text(pythonBridge.liveTranscription)
+                                        .font(.system(.body, design: .rounded))
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 8)
+                                        .background(Color.black.opacity(0.75))
+                                        .cornerRadius(8)
+                                        .padding(.bottom, 16)
+                                }
+                            },
+                            alignment: .bottom
                         )
                 } else {
                     // Placeholder when camera is off
@@ -347,14 +327,22 @@ struct ContentView: View {
                 appendLog(logMsg)
             }
         }
+        .onReceive(pythonBridge.$liveTranscription) { transcription in
+            if !transcription.isEmpty {
+                appendLog("[Transcription] \(transcription)")
+            }
+        }
         .onAppear {
             captureEngine.frameHandler.setCallback { [weak faceEngine] sendableBuffer in
                 faceEngine?.processFrame(sendableBuffer)
             }
             
-            // Set up audio callback to validate audio ingestion without flooding the logs
+            // Route audio samples to Python VAD & transcription engine
             let printer = ThrottledPrinter(limit: 100)
-            captureEngine.audioHandler.setCallback { samples in
+            captureEngine.audioHandler.setCallback { [weak faceEngine, weak pythonBridge] samples in
+                let activeTracks = faceEngine?.safeActiveTracks ?? []
+                pythonBridge?.pushAudioSamples(samples, activeFaces: activeTracks)
+                
                 if printer.shouldPrint() {
                     let maxVal = samples.map(abs).max() ?? 0.0
                     Task { @MainActor in
@@ -535,6 +523,50 @@ struct LandmarksMeshView: View {
             x: point.x * size.width,
             y: (1.0 - point.y) * size.height
         )
+    }
+}
+
+struct FaceTrackOverlayView: View {
+    let track: ActiveFaceInfo
+    let geometrySize: CGSize
+    
+    var body: some View {
+        let bbox = track.boundingBox
+        let w = bbox.size.width * geometrySize.width
+        let h = bbox.size.height * geometrySize.height
+        let x = bbox.origin.x * geometrySize.width + w / 2
+        let y = (1.0 - bbox.origin.y - bbox.size.height) * geometrySize.height + h / 2
+        
+        ZStack {
+            // Bounding Box outline (neon green if speaking, white translucent if silent)
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(track.isActiveSpeaker ? Color.green : Color.white.opacity(0.4), lineWidth: track.isActiveSpeaker ? 3.0 : 1.5)
+                .frame(width: w, height: h)
+                .shadow(color: track.isActiveSpeaker ? Color.green.opacity(0.5) : Color.clear, radius: 6)
+                .overlay(
+                    LandmarksMeshView(
+                        landmarks: track.landmarks,
+                        color: track.isActiveSpeaker ? Color.green.opacity(0.7) : Color.white.opacity(0.4)
+                    )
+                )
+                .position(x: x, y: y)
+            
+            // Speaking label overlayed above the box
+            if track.isActiveSpeaker {
+                HStack(spacing: 4) {
+                    Image(systemName: "waveform.and.mic")
+                        .symbolEffect(.bounce, options: .repeating)
+                    Text("SPEAKING")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.green)
+                .foregroundColor(.black)
+                .cornerRadius(4)
+                .position(x: x, y: y - (h / 2) - 14)
+            }
+        }
     }
 }
 
