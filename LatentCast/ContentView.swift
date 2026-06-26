@@ -11,80 +11,122 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var permissionManager = PermissionManager()
-    @State private var isRunning = false
+    @StateObject private var captureEngine = AVCaptureEngine()
+    @State private var logs: [String] = ["[Idle] Ready. Waiting for user interaction."]
     
     var body: some View {
-        VStack(spacing: 24) {
-            // Header / App Title
-            HStack {
-                Image(systemName: "appletv.radio.broadcasting")
-                    .font(.system(size: 32))
-                    .foregroundColor(.purple)
-                    .symbolEffect(.pulse, isActive: isRunning)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("LatentCast")
-                        .font(.system(.title2, design: .rounded))
-                        .fontWeight(.bold)
-                    
-                    Text("Active Speaker Auto-Cropping & Subtitles")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
+        HStack(spacing: 20) {
+            // Left Column: Camera Preview
+            VStack {
+                if captureEngine.isSessionRunning {
+                    CameraPreview(session: captureEngine.session)
+                        .aspectRatio(16/9, contentMode: .fit)
+                        .cornerRadius(12)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .overlay(
+                            HStack {
+                                Circle()
+                                    .fill(Color.red)
+                                    .frame(width: 8, height: 8)
+                                    .symbolEffect(.pulse)
+                                Text("LIVE")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .fontWeight(.bold)
+                                Spacer()
+                                Text(String(format: "FPS: %.1f", captureEngine.fps))
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .fontWeight(.bold)
+                            }
+                            .padding(8)
+                            .foregroundColor(.white)
+                            .background(Color.black.opacity(0.6))
+                            .cornerRadius(6)
+                            .padding(8),
+                            alignment: .top
+                        )
+                } else {
+                    // Placeholder when camera is off
+                    VStack(spacing: 12) {
+                        Image(systemName: "camera.metering.none")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary)
+                        Text("Camera Offline")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .aspectRatio(16/9, contentMode: .fit)
+                    .background(Color.black.opacity(0.3))
+                    .cornerRadius(12)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    )
                 }
-                Spacer()
             }
-            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity)
             
-            // Status Card
-            VStack(alignment: .leading, spacing: 16) {
-                Text("SYSTEM STATUS")
-                    .font(.system(.caption2, design: .monospaced))
-                    .fontWeight(.semibold)
-                    .foregroundColor(.secondary)
+            // Right Column: Controls & Console
+            VStack(spacing: 20) {
+                // Header / App Title
+                HStack {
+                    Image(systemName: "appletv.radio.broadcasting")
+                        .font(.system(size: 28))
+                        .foregroundColor(.purple)
+                        .symbolEffect(.pulse, isActive: captureEngine.isSessionRunning)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("LatentCast")
+                            .font(.system(.title3, design: .rounded))
+                            .fontWeight(.bold)
+                        
+                        Text("Active Speaker Detection")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
                 
-                HStack(spacing: 20) {
-                    // Camera Permission Indicator
+                // Status Badges
+                VStack(alignment: .leading, spacing: 10) {
                     StatusBadge(
                         title: "Camera Access",
                         icon: "camera.fill",
                         status: permissionManager.cameraStatus
                     )
                     
-                    // Microphone Permission Indicator
                     StatusBadge(
                         title: "Microphone Access",
                         icon: "mic.fill",
                         status: permissionManager.microphoneStatus
                     )
                 }
-            }
-            .padding()
-            .background(Color.white.opacity(0.05))
-            .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
-            )
-            
-            // Controller Section
-            VStack(spacing: 16) {
+                
+                // Controller Button
                 if permissionManager.hasBothPermissions {
                     Button(action: {
                         withAnimation {
-                            isRunning.toggle()
+                            if captureEngine.isSessionRunning {
+                                captureEngine.stopSession()
+                            } else {
+                                captureEngine.startSession()
+                            }
                         }
                     }) {
                         HStack {
-                            Image(systemName: isRunning ? "stop.fill" : "play.fill")
-                            Text(isRunning ? "Stop Session" : "Start Session")
+                            Image(systemName: captureEngine.isSessionRunning ? "stop.fill" : "play.fill")
+                            Text(captureEngine.isSessionRunning ? "Stop Session" : "Start Session")
                                 .fontWeight(.semibold)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(isRunning ? Color.red.opacity(0.8) : Color.purple.opacity(0.8))
+                        .padding(.vertical, 12)
+                        .background(captureEngine.isSessionRunning ? Color.red.opacity(0.8) : Color.purple.opacity(0.8))
                         .foregroundColor(.white)
-                        .cornerRadius(10)
-                        .shadow(color: isRunning ? Color.red.opacity(0.3) : Color.purple.opacity(0.3), radius: 8, x: 0, y: 4)
+                        .cornerRadius(8)
+                        .shadow(color: captureEngine.isSessionRunning ? Color.red.opacity(0.2) : Color.purple.opacity(0.2), radius: 6, x: 0, y: 3)
                     }
                     .buttonStyle(.plain)
                 } else {
@@ -95,59 +137,71 @@ struct ContentView: View {
                     }) {
                         HStack {
                             Image(systemName: "shield.fill")
-                            Text("Grant Hardware Access")
+                            Text("Grant Access")
                                 .fontWeight(.semibold)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding()
+                        .padding(.vertical, 12)
                         .background(Color.blue.opacity(0.8))
                         .foregroundColor(.white)
-                        .cornerRadius(10)
-                        .shadow(color: Color.blue.opacity(0.3), radius: 8, x: 0, y: 4)
+                        .cornerRadius(8)
+                        .shadow(color: Color.blue.opacity(0.2), radius: 6, x: 0, y: 3)
                     }
                     .buttonStyle(.plain)
-                    
-                    Text("Please grant camera and microphone access to proceed.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
-            }
-            
-            // Console / Live Log Area
-            VStack(alignment: .leading, spacing: 8) {
-                Text("LIVE CONSOLE")
-                    .font(.system(.caption2, design: .monospaced))
-                    .fontWeight(.semibold)
-                    .foregroundColor(.secondary)
                 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
-                        Text("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
-                        if isRunning {
-                            Text("[System] Starting video compositor...")
-                            Text("[System] Initializing camera and mic streams...")
-                            Text("[Python] Bridge initialized.")
-                        } else {
-                            Text("[Idle] Ready. Waiting for user interaction.")
+                // Live Console Area
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("LIVE CONSOLE")
+                        .font(.system(.caption2, design: .monospaced))
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+                    
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(0..<logs.count, id: \.self) { index in
+                                    Text(logs[index])
+                                        .id(index)
+                                }
+                            }
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundColor(.green.opacity(0.8))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
+                        .frame(height: 120)
+                        .background(Color.black.opacity(0.4))
+                        .cornerRadius(6)
+                        .onChange(of: logs) {
+                            if !logs.isEmpty {
+                                proxy.scrollTo(logs.count - 1)
+                            }
                         }
                     }
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundColor(.green.opacity(0.8))
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding()
-                .frame(height: 100)
-                .background(Color.black.opacity(0.4))
-                .cornerRadius(8)
             }
+            .frame(width: 280)
         }
-        .padding(24)
-        .frame(minWidth: 480, maxWidth: .infinity, minHeight: 380, maxHeight: .infinity)
+        .padding(20)
+        .frame(minWidth: 780, maxWidth: .infinity, minHeight: 380, maxHeight: .infinity)
         .background(
             VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
                 .ignoresSafeArea()
         )
+        .onReceive(captureEngine.$lastLog) { logMsg in
+            if !logMsg.isEmpty {
+                logs.append(logMsg)
+                // Limit log size to last 50 entries
+                if logs.count > 50 {
+                    logs.removeFirst()
+                }
+            }
+        }
+        .onAppear {
+            logs.append("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
+            logs.append("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
+        }
     }
     
     private func statusString(_ status: AVAuthorizationStatus) -> String {
