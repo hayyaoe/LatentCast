@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		43BDEEC22FEE39B400E1A9A2 /* PythonKit in Frameworks */ = {isa = PBXBuildFile; productRef = F96B4DFBB0633FC91AB3DA39 /* PythonKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		43BDEE542FEE130D00E1A9A2 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				43BDEEC22FEE39B400E1A9A2 /* PythonKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +117,7 @@
 			);
 			name = LatentCast;
 			packageProductDependencies = (
+				F96B4DFBB0633FC91AB3DA39 /* PythonKit */,
 			);
 			productName = LatentCast;
 			productReference = 43BDEE442FEE130C00E1A9A2 /* LatentCast.app */;
@@ -195,6 +201,9 @@
 			);
 			mainGroup = 43BDEE3B2FEE130C00E1A9A2;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				41FB435ABE09A8F7CE2B2C28 /* XCRemoteSwiftPackageReference "PythonKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 43BDEE452FEE130C00E1A9A2 /* Products */;
 			projectDirPath = "";
@@ -575,6 +584,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		41FB435ABE09A8F7CE2B2C28 /* XCRemoteSwiftPackageReference "PythonKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pvieito/PythonKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.3.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		F96B4DFBB0633FC91AB3DA39 /* PythonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 41FB435ABE09A8F7CE2B2C28 /* XCRemoteSwiftPackageReference "PythonKit" */;
+			productName = PythonKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 43BDEE3C2FEE130C00E1A9A2 /* Project object */;
 }

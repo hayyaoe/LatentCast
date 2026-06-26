@@ -13,6 +13,7 @@ struct ContentView: View {
     @StateObject private var permissionManager = PermissionManager()
     @StateObject private var captureEngine = AVCaptureEngine()
     @StateObject private var faceEngine = VisionFaceEngine()
+    @StateObject private var pythonBridge = PythonBridge()
     @State private var logs: [String] = ["[Idle] Ready. Waiting for user interaction."]
     
     var body: some View {
@@ -147,6 +148,27 @@ struct ContentView: View {
                         icon: "mic.fill",
                         status: permissionManager.microphoneStatus
                     )
+                    
+                    // Python Connection Status Badge
+                    HStack(spacing: 12) {
+                        Image(systemName: "square.and.at.rectangle.fill")
+                            .font(.title3)
+                            .foregroundColor(pythonBridge.connectionStatus.contains("Connected") ? .green : (pythonBridge.connectionStatus.contains("Failed") ? .red : .orange))
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Python Bridge")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            
+                            Text(pythonBridge.connectionStatus)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background((pythonBridge.connectionStatus.contains("Connected") ? Color.green : (pythonBridge.connectionStatus.contains("Failed") ? Color.red : Color.orange)).opacity(0.1))
+                    .cornerRadius(8)
                 }
                 
                 // Controller Button
@@ -233,6 +255,48 @@ struct ContentView: View {
                     .cornerRadius(8)
                     .transition(.opacity.combined(with: .scale))
                 }
+                
+                // Python Diagnostics Panel
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("PYTHON DIAGNOSTICS")
+                        .font(.system(.caption2, design: .monospaced))
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+                    
+                    HStack {
+                        Button(action: {
+                            pythonBridge.testCommunication(message: "Ping from Swift! Time: \(Date().timeIntervalSince1970)")
+                        }) {
+                            HStack {
+                                Image(systemName: "paperplane.fill")
+                                Text("Test Bridge")
+                            }
+                            .font(.footnote)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.8))
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!pythonBridge.connectionStatus.contains("Connected"))
+                        
+                        Spacer()
+                    }
+                    
+                    if !pythonBridge.lastResponse.isEmpty {
+                        Text(pythonBridge.lastResponse)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.yellow)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.black.opacity(0.3))
+                            .cornerRadius(6)
+                    }
+                }
+                .padding(10)
+                .background(Color.white.opacity(0.03))
+                .cornerRadius(8)
                 
                 // Live Console Area
                 VStack(alignment: .leading, spacing: 6) {
