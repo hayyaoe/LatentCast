@@ -37,6 +37,15 @@ struct LatentCastApp: App {
     
     init() {
         print("[LatentCastApp] init() called - App struct created")
+        // Force the app to activate after the run loop starts
+        DispatchQueue.main.async {
+            print("[LatentCastApp] Activating app and ordering windows front...")
+            NSApp.activate()
+            for window in NSApp.windows {
+                print("[LatentCastApp] Window: \(window.title), isVisible: \(window.isVisible), frame: \(window.frame)")
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
     }
     
     var body: some Scene {

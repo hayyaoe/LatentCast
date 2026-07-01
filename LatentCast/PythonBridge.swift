@@ -184,53 +184,54 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     
     /// Configures environments, dynamic libs, and imports python modules
     func setupPythonEnvironment() {
-        print("[PythonBridge] Setting up Python environment...")
-        
-        // 1. Point PythonKit to Miniconda's shared library dynamically based on real home directory
-        let homeDir: String
-        if let pw = getpwuid(getuid()) {
-            homeDir = String(cString: pw.pointee.pw_dir)
-        } else {
-            homeDir = NSHomeDirectory()
-        }
-        
-        let pythonLibPath = "\(homeDir)/miniconda3/lib/libpython3.13.dylib"
-        print("[PythonBridge] Resolved home directory: \(homeDir)")
-        
-        Self.envLock.lock()
-        let needsSetup = !Self.isEnvSetupDone
-        if needsSetup {
-            print("[PythonBridge] Configuring process-global Python library paths...")
-            print("[PythonBridge] Setting PYTHON_LIBRARY to: \(pythonLibPath)")
-            
-            if FileManager.default.fileExists(atPath: pythonLibPath) {
-                print("[PythonBridge] Success: Python library found at target path.")
-            } else {
-                print("[PythonBridge] WARNING: Python library file does not exist at: \(pythonLibPath)")
-            }
-            
-            setenv("PYTHON_LIBRARY", pythonLibPath, 1)
-            setenv("PYTHON_LOADER_LOGGING", "TRUE", 1)
-            setenv("PYTHONIOENCODING", "utf-8", 1)
-            setenv("PYTHONUTF8", "1", 1)
-            setenv("DISABLE_VIRTUAL_CAMERA", "1", 1)
-            
-            // Programmatically configure PythonKit to load the exact dylib target
-            PythonLibrary.useLibrary(at: pythonLibPath)
-            
-            // 2. Set PYTHONPATH to locate the workspace and virtual environment dependencies dynamically
-            let sitePackages = "\(projectPath)/.venv/lib/python3.13/site-packages"
-            print("[PythonBridge] Setting PYTHONPATH to: \(projectPath):\(sitePackages)")
-            setenv("PYTHONPATH", "\(projectPath):\(sitePackages)", 1)
-            
-            Self.isEnvSetupDone = true
-        } else {
-            print("[PythonBridge] Process-global Python library already configured.")
-        }
-        Self.envLock.unlock()
+        print("[PythonBridge] Scheduling setupPythonEnvironment on background PythonThread...")
         
         pythonThread.async { [weak self] in
             guard let self = self else { return }
+            
+            // 1. Point PythonKit to Miniconda's shared library dynamically based on real home directory
+            let homeDir: String
+            if let pw = getpwuid(getuid()) {
+                homeDir = String(cString: pw.pointee.pw_dir)
+            } else {
+                homeDir = NSHomeDirectory()
+            }
+            
+            let pythonLibPath = "\(homeDir)/miniconda3/lib/libpython3.13.dylib"
+            print("[PythonBridge] Resolved home directory: \(homeDir)")
+            
+            Self.envLock.lock()
+            let needsSetup = !Self.isEnvSetupDone
+            if needsSetup {
+                print("[PythonBridge] Configuring process-global Python library paths...")
+                print("[PythonBridge] Setting PYTHON_LIBRARY to: \(pythonLibPath)")
+                
+                if FileManager.default.fileExists(atPath: pythonLibPath) {
+                    print("[PythonBridge] Success: Python library found at target path.")
+                } else {
+                    print("[PythonBridge] WARNING: Python library file does not exist at: \(pythonLibPath)")
+                }
+                
+                setenv("PYTHON_LIBRARY", pythonLibPath, 1)
+                setenv("PYTHON_LOADER_LOGGING", "TRUE", 1)
+                setenv("PYTHONIOENCODING", "utf-8", 1)
+                setenv("PYTHONUTF8", "1", 1)
+                setenv("DISABLE_VIRTUAL_CAMERA", "1", 1)
+                
+                // Programmatically configure PythonKit to load the exact dylib target
+                PythonLibrary.useLibrary(at: pythonLibPath)
+                
+                // 2. Set PYTHONPATH to locate the workspace and virtual environment dependencies dynamically
+                let sitePackages = "\(self.projectPath)/.venv/lib/python3.13/site-packages"
+                print("[PythonBridge] Setting PYTHONPATH to: \(self.projectPath):\(sitePackages)")
+                setenv("PYTHONPATH", "\(self.projectPath):\(sitePackages)", 1)
+                
+                Self.isEnvSetupDone = true
+            } else {
+                print("[PythonBridge] Process-global Python library already configured.")
+            }
+            Self.envLock.unlock()
+            
             do {
                 print("[PythonBridge] Attempting to import bridge_logic module...")
                 let bridgeLogic = try Python.attemptImport("bridge_logic")
@@ -257,7 +258,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                         guard let self = self else { return }
                         let speaker = self.dequeueSpeakerLabel()
                         
-                        var finalFullText = ""
+                        let finalFullText: String
                         var segmentsToRegister: [(text: String, start: Double, end: Double)] = []
                         
                         if let jsonData = rawText.data(using: .utf8),
@@ -303,8 +304,9 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                         }
                         self.lock.unlock()
                         
+                        let textToPublish = finalFullText
                         Task { @MainActor in
-                            self.liveTranscription = finalFullText
+                            self.liveTranscription = textToPublish
                         }
                     }
                     self.whisperWorker = worker
