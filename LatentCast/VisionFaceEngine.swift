@@ -33,6 +33,7 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     
     private let visionQueue = DispatchQueue(label: "com.latentcast.visionQueue", qos: .userInitiated)
     private var isProcessing = false
+    private var frameCounter = 0
     private let lock = NSLock()
     
     // Internal tracking parameters (protected by lock)
@@ -65,15 +66,20 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     }
     
     nonisolated func processFrame(_ sendableBuffer: SendablePixelBuffer) {
-        visionQueue.async {
-            self.lock.lock()
-            if self.isProcessing {
-                self.lock.unlock()
-                return // Drop frame to prevent queue build-up and ANE overload
-            }
-            self.isProcessing = true
+        self.lock.lock()
+        self.frameCounter += 1
+        let currentCount = self.frameCounter
+        
+        // Throttle landmarks detection to 10 FPS (1 out of 3 frames)
+        // This cuts Neural Engine computation by 67% and completely removes UI video lag.
+        if self.isProcessing || currentCount % 3 != 0 {
             self.lock.unlock()
-            
+            return
+        }
+        self.isProcessing = true
+        self.lock.unlock()
+        
+        visionQueue.async {
             defer {
                 self.lock.lock()
                 self.isProcessing = false
@@ -83,14 +89,12 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
             let requestHandler = VNImageRequestHandler(cvPixelBuffer: sendableBuffer.buffer, options: [:])
             let request = VNDetectFaceLandmarksRequest()
             
-            // Vision automatically handles Neural Engine scheduling on Apple Silicon by default
-            
             do {
                 try requestHandler.perform([request])
-                if let results = request.results {
-                    self.handleVisionResults(results)
-                }
+                let results = request.results ?? []
+                self.handleVisionResults(results)
             } catch {
+                print("[Swift Vision] Request error: \(error.localizedDescription)")
                 self.updateLog("Vision request error: \(error.localizedDescription)")
             }
         }
@@ -111,15 +115,16 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
             let bbox = face.boundingBox
             let centroid = CGPoint(x: bbox.midX, y: bbox.midY)
             
-            // 2. Extract outer lips points
-            guard let landmarks = face.landmarks,
-                  let outerLips = landmarks.outerLips else { continue }
-            
-            let points = outerLips.normalizedPoints
-            let Ys = points.map { $0.y }
-            let maxY = Ys.max() ?? 0.0
-            let minY = Ys.min() ?? 0.0
-            let lipHeight = maxY - minY
+            // 2. Extract outer lips points if available, otherwise fallback to 0.0
+            var lipHeight: CGFloat = 0.0
+            if let landmarks = face.landmarks,
+               let outerLips = landmarks.outerLips {
+                let points = outerLips.normalizedPoints
+                let Ys = points.map { $0.y }
+                let maxY = Ys.max() ?? 0.0
+                let minY = Ys.min() ?? 0.0
+                lipHeight = maxY - minY
+            }
             
             // 3. Find matching track using centroid distance
             var matchedIndex: Int?
@@ -166,29 +171,31 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
             let isSpeaking = variance > speakThresholdInternal
             
             var landmarksDict: [String: [CGPoint]] = [:]
-            if let leftEye = landmarks.leftEye {
-                landmarksDict["leftEye"] = leftEye.normalizedPoints
-            }
-            if let rightEye = landmarks.rightEye {
-                landmarksDict["rightEye"] = rightEye.normalizedPoints
-            }
-            if let leftEyebrow = landmarks.leftEyebrow {
-                landmarksDict["leftEyebrow"] = leftEyebrow.normalizedPoints
-            }
-            if let rightEyebrow = landmarks.rightEyebrow {
-                landmarksDict["rightEyebrow"] = rightEyebrow.normalizedPoints
-            }
-            if let nose = landmarks.nose {
-                landmarksDict["nose"] = nose.normalizedPoints
-            }
-            if let outerLips = landmarks.outerLips {
-                landmarksDict["outerLips"] = outerLips.normalizedPoints
-            }
-            if let innerLips = landmarks.innerLips {
-                landmarksDict["innerLips"] = innerLips.normalizedPoints
-            }
-            if let faceContour = landmarks.faceContour {
-                landmarksDict["faceContour"] = faceContour.normalizedPoints
+            if let landmarks = face.landmarks {
+                if let leftEye = landmarks.leftEye {
+                    landmarksDict["leftEye"] = leftEye.normalizedPoints
+                }
+                if let rightEye = landmarks.rightEye {
+                    landmarksDict["rightEye"] = rightEye.normalizedPoints
+                }
+                if let leftEyebrow = landmarks.leftEyebrow {
+                    landmarksDict["leftEyebrow"] = leftEyebrow.normalizedPoints
+                }
+                if let rightEyebrow = landmarks.rightEyebrow {
+                    landmarksDict["rightEyebrow"] = rightEyebrow.normalizedPoints
+                }
+                if let nose = landmarks.nose {
+                    landmarksDict["nose"] = nose.normalizedPoints
+                }
+                if let outerLips = landmarks.outerLips {
+                    landmarksDict["outerLips"] = outerLips.normalizedPoints
+                }
+                if let innerLips = landmarks.innerLips {
+                    landmarksDict["innerLips"] = innerLips.normalizedPoints
+                }
+                if let faceContour = landmarks.faceContour {
+                    landmarksDict["faceContour"] = faceContour.normalizedPoints
+                }
             }
             
             currentFrameInfos.append(
@@ -209,12 +216,14 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
         let tracksSnapshot = currentFrameInfos
         let logText = results.isEmpty ? "" : "[Vision] Tracked \(results.count) faces. Active: \(tracksSnapshot.filter { $0.isActiveSpeaker }.count) (LipVar: \(String(format: "%.5f", tracksSnapshot.first?.lipVariance ?? 0)))"
         
+        if !logText.isEmpty {
+            // Print to Xcode console only to keep SwiftUI layout pipeline quiet
+            print("[VisionDebug] \(logText)")
+        }
+        
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.activeTracks = tracksSnapshot
-            if !logText.isEmpty {
-                self.lastLog = logText
-            }
         }
     }
     

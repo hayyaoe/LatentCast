@@ -10,11 +10,14 @@ import AVFoundation
 import Combine
 
 struct ContentView: View {
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var permissionManager = PermissionManager()
-    @StateObject private var captureEngine = AVCaptureEngine()
+    @ObservedObject var captureEngine: AVCaptureEngine
     @StateObject private var faceEngine = VisionFaceEngine()
     @StateObject private var pythonBridge = PythonBridge()
     @State private var logs: [String] = ["[Idle] Ready. Waiting for user interaction."]
+    @State private var micLevel: Float = 0.0
+    @State private var showLandmarks = false
     
     // Configurable thresholds for Heuristic Fusion Tuning
     @State private var faceEngineSpeakThreshold: Double = 0.0003
@@ -28,17 +31,17 @@ struct ContentView: View {
                 if captureEngine.isSessionRunning {
                     CameraPreview(session: captureEngine.session)
                         .aspectRatio(16/9, contentMode: .fit)
+                        .overlay(
+                            GeometryReader { geometry in
+                                ForEach(faceEngine.activeTracks) { track in
+                                    FaceTrackOverlayView(track: track, geometrySize: geometry.size, showLandmarks: showLandmarks)
+                                }
+                            }
+                        )
                         .cornerRadius(12)
                         .overlay(
                             RoundedRectangle(cornerRadius: 12)
                                 .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        )
-                        .overlay(
-                            GeometryReader { geometry in
-                                ForEach(faceEngine.activeTracks) { track in
-                                    FaceTrackOverlayView(track: track, geometrySize: geometry.size)
-                                }
-                            }
                         )
                         .overlay(
                             HStack {
@@ -61,22 +64,7 @@ struct ContentView: View {
                             .padding(8),
                             alignment: .top
                         )
-                        .overlay(
-                            Group {
-                                if !pythonBridge.liveTranscription.isEmpty {
-                                    Text(pythonBridge.liveTranscription)
-                                        .font(.system(.body, design: .rounded))
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(.white)
-                                        .padding(.horizontal, 16)
-                                        .padding(.vertical, 8)
-                                        .background(Color.black.opacity(0.75))
-                                        .cornerRadius(8)
-                                        .padding(.bottom, 16)
-                                }
-                            },
-                            alignment: .bottom
-                        )
+
                 } else {
                     // Placeholder when camera is off
                     VStack(spacing: 12) {
@@ -181,6 +169,26 @@ struct ContentView: View {
                         .shadow(color: captureEngine.isSessionRunning ? Color.red.opacity(0.2) : Color.purple.opacity(0.2), radius: 6, x: 0, y: 3)
                     }
                     .buttonStyle(.plain)
+                    
+                    if captureEngine.isSessionRunning {
+                        Button(action: {
+                            openWindow(id: "clean-feed")
+                        }) {
+                            HStack {
+                                Image(systemName: "video")
+                                Text("Open Clean Feed Window")
+                                    .fontWeight(.semibold)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.blue.opacity(0.8))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                            .shadow(color: Color.blue.opacity(0.2), radius: 6, x: 0, y: 3)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 5)
+                    }
                 } else {
                     Button(action: {
                         Task {
@@ -295,6 +303,47 @@ struct ContentView: View {
                                 pythonBridge.updateParameters(silenceTimeoutMs: pythonBridgeSilenceTimeout, fusionThreshold: pythonBridgeFusionThreshold)
                             }
                     }
+
+                    // 5. Whisper Model Selector
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Whisper Model")
+                                .font(.caption2)
+                            Spacer()
+                        }
+                        Picker("", selection: Binding(
+                            get: { pythonBridge.selectedModel },
+                            set: { pythonBridge.changeModel(to: $0) }
+                        )) {
+                            Text("Tiny (Fast)").tag("mlx-community/whisper-tiny-mlx")
+                            Text("Base").tag("mlx-community/whisper-base-mlx")
+                            Text("Small (Default)").tag("mlx-community/whisper-small-mlx")
+                            Text("Medium").tag("mlx-community/whisper-medium-mlx")
+                            Text("Large Turbo").tag("mlx-community/whisper-large-v3-turbo")
+                            Text("Large V3").tag("mlx-community/whisper-large-v3-mlx")
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
+                    
+                    // 6. Use CPU Toggle
+                    Toggle(isOn: Binding(
+                        get: { pythonBridge.useCPU },
+                        set: { pythonBridge.changeWorkerConfig(modelName: pythonBridge.selectedModel, useCPU: $0) }
+                    )) {
+                        Text("Use CPU for Whisper")
+                            .font(.caption2)
+                    }
+                    .toggleStyle(SwitchToggleStyle(tint: .purple))
+                    .padding(.top, 4)
+                    
+                    // 7. Show Landmarks Toggle
+                    Toggle(isOn: $showLandmarks) {
+                        Text("Show Face Landmarks")
+                            .font(.caption2)
+                    }
+                    .toggleStyle(SwitchToggleStyle(tint: .green))
+                    .padding(.top, 4)
                 }
                 .padding(10)
                 .background(Color.white.opacity(0.04))
@@ -397,6 +446,11 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            print("[ContentView] onAppear: setting faceEngine and pythonBridge references on captureEngine")
+            captureEngine.faceEngine = faceEngine
+            captureEngine.pythonBridge = pythonBridge
+            print("[ContentView] onAppear: captureEngine.pythonBridge is set to: \(captureEngine.pythonBridge != nil ? "non-nil" : "nil")")
+            
             captureEngine.frameHandler.setCallback { [weak faceEngine] sendableBuffer in
                 faceEngine?.processFrame(sendableBuffer)
             }
@@ -411,8 +465,12 @@ struct ContentView: View {
                 let activeTracks = faceEngine?.safeActiveTracks ?? []
                 pythonBridge?.pushAudioSamples(samples, activeFaces: activeTracks)
                 
+                let maxVal = samples.map(abs).max() ?? 0.0
+                Task { @MainActor in
+                    self.micLevel = maxVal
+                }
+                
                 if printer.shouldPrint() {
-                    let maxVal = samples.map(abs).max() ?? 0.0
                     Task { @MainActor in
                         appendLog("[Audio] Captured \(samples.count) samples. Peak amplitude: \(String(format: "%.4f", maxVal))")
                     }
@@ -421,6 +479,12 @@ struct ContentView: View {
             
             appendLog("[Permission] Camera status: \(statusString(permissionManager.cameraStatus))")
             appendLog("[Permission] Microphone status: \(statusString(permissionManager.microphoneStatus))")
+        }
+        .onDisappear {
+            print("[ContentView] onDisappear: stopping session and cleaning pipeline references")
+            captureEngine.stopSession()
+            captureEngine.faceEngine = nil
+            captureEngine.pythonBridge = nil
         }
     }
     
@@ -543,7 +607,7 @@ class PermissionManager: ObservableObject {
 }
 
 #Preview {
-    ContentView()
+    ContentView(captureEngine: AVCaptureEngine())
 }
 
 struct LandmarksMeshView: View {
@@ -560,9 +624,12 @@ struct LandmarksMeshView: View {
                     
                     let firstPt = mapPoint(points[0], to: size)
                     path.move(to: firstPt)
+                    path.addEllipse(in: CGRect(x: firstPt.x - 1.0, y: firstPt.y - 1.0, width: 2.0, height: 2.0))
                     
                     for i in 1..<points.count {
-                        path.addLine(to: mapPoint(points[i], to: size))
+                        let pt = mapPoint(points[i], to: size)
+                        path.addLine(to: pt)
+                        path.addEllipse(in: CGRect(x: pt.x - 1.0, y: pt.y - 1.0, width: 2.0, height: 2.0))
                     }
                     
                     if key.contains("Eye") || key.contains("Lips") {
@@ -571,18 +638,6 @@ struct LandmarksMeshView: View {
                 }
             }
             .stroke(color, lineWidth: 1.0)
-            
-            ForEach(Array(landmarks.keys), id: \.self) { key in
-                if let points = landmarks[key] {
-                    ForEach(0..<points.count, id: \.self) { index in
-                        let pt = mapPoint(points[index], to: size)
-                        Circle()
-                            .fill(color)
-                            .frame(width: 2.0, height: 2.0)
-                            .position(pt)
-                    }
-                }
-            }
         }
     }
     
@@ -597,6 +652,7 @@ struct LandmarksMeshView: View {
 struct FaceTrackOverlayView: View {
     let track: ActiveFaceInfo
     let geometrySize: CGSize
+    let showLandmarks: Bool
     
     var body: some View {
         let bbox = track.boundingBox
@@ -612,18 +668,20 @@ struct FaceTrackOverlayView: View {
                 .frame(width: w, height: h)
                 .shadow(color: track.isActiveSpeaker ? Color.green.opacity(0.5) : Color.clear, radius: 6)
                 .overlay(
-                    LandmarksMeshView(
-                        landmarks: track.landmarks,
-                        color: track.isActiveSpeaker ? Color.green.opacity(0.7) : Color.white.opacity(0.4)
-                    )
+                    Group {
+                        if showLandmarks {
+                            LandmarksMeshView(
+                                landmarks: track.landmarks,
+                                color: track.isActiveSpeaker ? Color.green.opacity(0.7) : Color.white.opacity(0.4)
+                            )
+                        }
+                    }
                 )
                 .position(x: x, y: y)
             
-            // Speaking label overlayed above the box
             if track.isActiveSpeaker {
                 HStack(spacing: 4) {
                     Image(systemName: "waveform.and.mic")
-                        .symbolEffect(.bounce, options: .repeating)
                     Text("SPEAKING")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                 }

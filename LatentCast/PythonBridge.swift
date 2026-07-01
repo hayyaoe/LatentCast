@@ -7,7 +7,47 @@
 
 import Foundation
 import Combine
+import CoreVideo
 import PythonKit
+
+/// Dedicated OS thread for executing all Python / PythonKit operations.
+/// This guarantees that Python is always accessed from the exact same OS thread,
+/// eliminating any GCD cross-thread GIL scheduling deadlocks and spin-locks.
+class PythonThread: Thread, @unchecked Sendable {
+    private var tasks: [() -> Void] = []
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    
+    override func main() {
+        print("[PythonThread] Dedicated Python execution thread active.")
+        while !isCancelled {
+            lock.lock()
+            if tasks.isEmpty {
+                lock.unlock()
+                _ = semaphore.wait(timeout: .distantFuture)
+                continue
+            }
+            let task = tasks.removeFirst()
+            lock.unlock()
+            
+            task()
+        }
+        print("[PythonThread] Dedicated Python execution thread exiting.")
+    }
+    
+    func async(execute task: @escaping () -> Void) {
+        guard !isCancelled else { return }
+        lock.lock()
+        tasks.append(task)
+        lock.unlock()
+        semaphore.signal()
+    }
+    
+    func stop() {
+        cancel()
+        semaphore.signal()
+    }
+}
 
 // Thread-safe communication bridge with Python running in-process via PythonKit
 class PythonBridge: ObservableObject, @unchecked Sendable {
@@ -18,10 +58,73 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     @Published var isVoiceActive: Bool = false
     @Published var silenceTimeoutMs: Double = 600.0
     @Published var fusionThreshold: Double = 0.00010
+    @Published var selectedModel: String = "mlx-community/whisper-small-mlx"
+    @Published var useCPU: Bool = false
+    
+    private var swiftAudioBuffer: [Float] = []
+    
+    private static var isEnvSetupDone = false
+    private static let envLock = NSLock()
     
     private var pyEngine: PythonObject?
-    private let pythonQueue = DispatchQueue(label: "com.latentcast.pythonQueue", qos: .userInitiated)
+    private var safeSubtitle: String = ""
+    
+    struct SubtitleSegment: Sendable {
+        let text: String
+        let startTime: Double
+        let endTime: Double
+    }
+    private var activeSubtitles: [SubtitleSegment] = []
+    
+    private struct PendingSegment {
+        let startTime: Double
+        let endTime: Double
+        let speaker: String
+    }
+    private var pendingSegments: [PendingSegment] = []
+    
+    private let pythonThread = PythonThread()
     private let lock = NSLock()
+    private var audioChunkCount = 0
+    
+    var currentSubtitle: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return safeSubtitle
+    }
+    
+    func subtitle(for timestamp: Double) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if let match = activeSubtitles.first(where: { timestamp >= ($0.startTime - 0.2) && timestamp <= ($0.endTime + 0.8) }) {
+            return match.text
+        }
+        return ""
+    }
+    
+    func changeWorkerConfig(modelName: String, useCPU: Bool) {
+        lock.lock()
+        let callback = whisperWorker?.onTranscriptionReceived
+        whisperWorker?.stop()
+        pendingSegments.removeAll()
+        
+        let deviceStr = useCPU ? "cpu" : "gpu"
+        print("[PythonBridge] Restarting Whisper worker: model=\(modelName), device=\(deviceStr)")
+        
+        let newWorker = WhisperWorker(projectPath: projectPath, modelName: modelName, deviceType: deviceStr)
+        newWorker.onTranscriptionReceived = callback
+        whisperWorker = newWorker
+        lock.unlock()
+        
+        Task { @MainActor in
+            self.selectedModel = modelName
+            self.useCPU = useCPU
+        }
+    }
+    
+    func changeModel(to modelName: String) {
+        changeWorkerConfig(modelName: modelName, useCPU: self.useCPU)
+    }
     
     // Whisper worker subprocess variables
     private var whisperWorker: WhisperWorker?
@@ -36,29 +139,35 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     private typealias GILReleaseFunc = @convention(c) (Int32) -> Void
     private var gilEnsure: GILEnsureFunc?
     private var gilRelease: GILReleaseFunc?
+    private var pythonLibHandle: UnsafeMutableRawPointer?
     
     init() {
         let sourceFile = URL(fileURLWithPath: #filePath)
         let projectRoot = sourceFile.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         self.projectPath = projectRoot.path
+        
+        // Start the dedicated thread loop for all Python executions
+        pythonThread.name = "com.latentcast.pythonThread"
+        pythonThread.start()
+        
         setupPythonEnvironment()
     }
     
     /// Dynamically loads PyGILState_Ensure/Release from libpython via dlsym
-    private func setupGILFunctions() {
-        guard let handle = dlopen(nil, RTLD_LAZY) else {
-            print("[GIL] Warning: Failed to open global symbol table")
+    private func setupGILFunctions(libPath: String) {
+        guard let handle = dlopen(libPath, RTLD_LAZY | RTLD_GLOBAL) else {
+            print("[GIL] Warning: Failed to open Python library at \(libPath)")
             return
         }
-        defer { dlclose(handle) }
+        self.pythonLibHandle = handle // Keep handle open so symbols remain valid
         
         if let ensureSym = dlsym(handle, "PyGILState_Ensure"),
            let releaseSym = dlsym(handle, "PyGILState_Release") {
             gilEnsure = unsafeBitCast(ensureSym, to: GILEnsureFunc.self)
             gilRelease = unsafeBitCast(releaseSym, to: GILReleaseFunc.self)
-            print("[GIL] PyGILState_Ensure/Release loaded successfully")
+            print("[GIL] PyGILState_Ensure/Release loaded successfully from \(libPath)")
         } else {
-            print("[GIL] Warning: Could not find PyGILState symbols - GIL safety disabled")
+            print("[GIL] Warning: Could not find PyGILState symbols in \(libPath) - GIL safety disabled")
         }
     }
     
@@ -87,29 +196,47 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         
         let pythonLibPath = "\(homeDir)/miniconda3/lib/libpython3.13.dylib"
         print("[PythonBridge] Resolved home directory: \(homeDir)")
-        print("[PythonBridge] Setting PYTHON_LIBRARY to: \(pythonLibPath)")
         
-        if FileManager.default.fileExists(atPath: pythonLibPath) {
-            print("[PythonBridge] Success: Python library found at target path.")
+        Self.envLock.lock()
+        let needsSetup = !Self.isEnvSetupDone
+        if needsSetup {
+            print("[PythonBridge] Configuring process-global Python library paths...")
+            print("[PythonBridge] Setting PYTHON_LIBRARY to: \(pythonLibPath)")
+            
+            if FileManager.default.fileExists(atPath: pythonLibPath) {
+                print("[PythonBridge] Success: Python library found at target path.")
+            } else {
+                print("[PythonBridge] WARNING: Python library file does not exist at: \(pythonLibPath)")
+            }
+            
+            setenv("PYTHON_LIBRARY", pythonLibPath, 1)
+            setenv("PYTHON_LOADER_LOGGING", "TRUE", 1)
+            setenv("PYTHONIOENCODING", "utf-8", 1)
+            setenv("PYTHONUTF8", "1", 1)
+            setenv("DISABLE_VIRTUAL_CAMERA", "1", 1)
+            
+            // Programmatically configure PythonKit to load the exact dylib target
+            PythonLibrary.useLibrary(at: pythonLibPath)
+            
+            // 2. Set PYTHONPATH to locate the workspace and virtual environment dependencies dynamically
+            let sitePackages = "\(projectPath)/.venv/lib/python3.13/site-packages"
+            print("[PythonBridge] Setting PYTHONPATH to: \(projectPath):\(sitePackages)")
+            setenv("PYTHONPATH", "\(projectPath):\(sitePackages)", 1)
+            
+            Self.isEnvSetupDone = true
         } else {
-            print("[PythonBridge] WARNING: Python library file does not exist at: \(pythonLibPath)")
+            print("[PythonBridge] Process-global Python library already configured.")
         }
+        Self.envLock.unlock()
         
-        setenv("PYTHON_LIBRARY", pythonLibPath, 1)
-        
-        // 2. Set PYTHONPATH to locate the workspace and virtual environment dependencies dynamically
-        let sitePackages = "\(projectPath)/.venv/lib/python3.13/site-packages"
-        print("[PythonBridge] Setting PYTHONPATH to: \(projectPath):\(sitePackages)")
-        setenv("PYTHONPATH", "\(projectPath):\(sitePackages)", 1)
-        
-        pythonQueue.async { [weak self] in
+        pythonThread.async { [weak self] in
             guard let self = self else { return }
             do {
                 print("[PythonBridge] Attempting to import bridge_logic module...")
                 let bridgeLogic = try Python.attemptImport("bridge_logic")
                 
                 // Initialize GIL management functions now that Python library is loaded
-                self.setupGILFunctions()
+                self.setupGILFunctions(libPath: pythonLibPath)
                 
                 // Initialize the Python engine with GIL held
                 let engine = self.withGIL {
@@ -125,13 +252,59 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                     print("[PythonBridge] PythonBridgeEngine successfully loaded!")
                     
                     // Initialize the subprocess Whisper worker
-                    let worker = WhisperWorker(projectPath: self.projectPath)
-                    worker.onTranscriptionReceived = { [weak self] text in
+                    let worker = WhisperWorker(projectPath: self.projectPath, modelName: self.selectedModel, deviceType: self.useCPU ? "cpu" : "gpu")
+                    worker.onTranscriptionReceived = { [weak self] rawText in
                         guard let self = self else { return }
                         let speaker = self.dequeueSpeakerLabel()
-                        let fullTranscription = "[\(speaker)]: \(text)"
+                        
+                        var finalFullText = ""
+                        var segmentsToRegister: [(text: String, start: Double, end: Double)] = []
+                        
+                        if let jsonData = rawText.data(using: .utf8),
+                           let response = try? JSONDecoder().decode(WhisperResponse.self, from: jsonData) {
+                            finalFullText = "[\(speaker)]: \(response.text)"
+                            
+                            self.lock.lock()
+                            let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
+                            self.lock.unlock()
+                            
+                            if let seg = pending {
+                                if response.segments.isEmpty {
+                                    segmentsToRegister.append((text: finalFullText, start: seg.startTime, end: seg.endTime))
+                                } else {
+                                    for subSeg in response.segments {
+                                        // Offset Whisper's relative start/end times by VAD segment start time
+                                        let absStart = seg.startTime + subSeg.start
+                                        let absEnd = seg.startTime + subSeg.end
+                                        segmentsToRegister.append((text: "[\(speaker)]: \(subSeg.text)", start: absStart, end: absEnd))
+                                    }
+                                }
+                            }
+                        } else {
+                            // Fallback to plain-text output mapping if JSON parsing fails
+                            finalFullText = "[\(speaker)]: \(rawText)"
+                            
+                            self.lock.lock()
+                            let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
+                            self.lock.unlock()
+                            
+                            if let seg = pending {
+                                segmentsToRegister.append((text: finalFullText, start: seg.startTime, end: seg.endTime))
+                            }
+                        }
+                        
+                        self.lock.lock()
+                        self.safeSubtitle = finalFullText
+                        for item in segmentsToRegister {
+                            self.activeSubtitles.append(SubtitleSegment(text: item.text, startTime: item.start, endTime: item.end))
+                        }
+                        if self.activeSubtitles.count > 200 {
+                            self.activeSubtitles.removeFirst(self.activeSubtitles.count - 200)
+                        }
+                        self.lock.unlock()
+                        
                         Task { @MainActor in
-                            self.liveTranscription = fullTranscription
+                            self.liveTranscription = finalFullText
                         }
                     }
                     self.whisperWorker = worker
@@ -147,7 +320,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     
     /// Sends a diagnostic test message to Python and updates UI with the reply
     func testCommunication(message: String) {
-        pythonQueue.async { [weak self] in
+        pythonThread.async { [weak self] in
             guard let self = self else { return }
             self.lock.lock()
             guard let engine = self.pyEngine else {
@@ -171,7 +344,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     
     /// Dynamically updates silence timeout and lip variance fusion threshold in the Python engine
     func updateParameters(silenceTimeoutMs: Double, fusionThreshold: Double) {
-        pythonQueue.async { [weak self] in
+        pythonThread.async { [weak self] in
             guard let self = self else { return }
             self.lock.lock()
             guard let engine = self.pyEngine else {
@@ -182,6 +355,46 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
             
             self.withGIL {
                 _ = engine.update_fusion_parameters(silenceTimeoutMs, fusionThreshold)
+            }
+        }
+    }
+    
+    /// Feeds the processed BGRA frame buffer pointer directly to Python virtual camera
+    func sendProcessedFrame(_ sendableBuffer: SendablePixelBuffer) {
+        self.lock.lock()
+        let isReady = self.pyEngine != nil
+        self.lock.unlock()
+        
+        guard isReady else {
+            print("[Swift Bridge] sendProcessedFrame: pyEngine is not ready, dropping frame")
+            return
+        }
+        
+        pythonThread.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            guard let engine = self.pyEngine else {
+                self.lock.unlock()
+                print("[Swift Bridge] sendProcessedFrame: pyEngine became nil inside queue, dropping frame")
+                return
+            }
+            self.lock.unlock()
+            
+            let pixelBuffer = sendableBuffer.buffer
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            
+            if let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                let address = Int(bitPattern: baseAddress)
+                let size = CVPixelBufferGetDataSize(pixelBuffer)
+                
+                print("[Swift Bridge] sendProcessedFrame: calling engine.send_frame_pointer(address=\(address), size=\(size))")
+                self.withGIL {
+                    _ = engine.send_frame_pointer(address, size)
+                }
+                print("[Swift Bridge] sendProcessedFrame: engine.send_frame_pointer finished successfully")
+            } else {
+                print("[Swift Bridge] sendProcessedFrame: Failed to get CVPixelBuffer base address")
             }
         }
     }
@@ -209,23 +422,36 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     func pushAudioSamples(_ samples: [Float], activeFaces: [ActiveFaceInfo]) {
         self.lock.lock()
         let isReady = self.pyEngine != nil
-        self.lock.unlock()
-        guard isReady else { return }
+        if !isReady {
+            self.lock.unlock()
+            return
+        }
         
-        let count = samples.count
-        guard count > 0 else { return }
+        swiftAudioBuffer.append(contentsOf: samples)
+        
+        // Only push to Python if we have accumulated at least 1024 samples (64ms of audio)
+        guard swiftAudioBuffer.count >= 1024 else {
+            self.lock.unlock()
+            return
+        }
+        
+        let samplesToPush = swiftAudioBuffer
+        swiftAudioBuffer.removeAll(keepingCapacity: true)
+        
+        let count = samplesToPush.count
         
         // 1. Allocate a heap buffer and copy samples.
         // We pass the raw memory address to Python to bypass PythonKit conversion overhead.
         let buffer = UnsafeMutablePointer<Float>.allocate(capacity: count)
-        buffer.initialize(from: samples, count: count)
+        buffer.initialize(from: samplesToPush, count: count)
         let address = Int(bitPattern: buffer)
         
         // 2. Pre-extract face IDs and variances into standard arrays
         let faceIds = activeFaces.map { $0.id.uuidString }
         let faceVariances = activeFaces.map { $0.lipVariance }
+        self.lock.unlock()
         
-        pythonQueue.async { [weak self] in
+        pythonThread.async { [weak self] in
             guard let pointer = UnsafeMutablePointer<Float>(bitPattern: address) else { return }
             defer {
                 pointer.deinitialize(count: count)
@@ -237,7 +463,13 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                 self.lock.unlock()
                 return
             }
+            self.audioChunkCount += 1
+            let currentChunk = self.audioChunkCount
             self.lock.unlock()
+            
+            if currentChunk % 50 == 0 || currentChunk <= 5 {
+                print("[Swift Bridge] pushAudioSamples queue: Chunk #\(currentChunk) processing \(count) samples. Active faces: \(faceIds.count)")
+            }
             
             self.withGIL {
                 let response = engine.process_audio_chunk_ptr(address, count, faceIds, faceVariances)
@@ -245,9 +477,17 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                 let isSpeaking = Bool(response["is_speaking"]) ?? false
                 let wavPath = String(response["wav_path"]) ?? ""
                 let speakerLabel = String(response["speaker_label"]) ?? ""
+                let startTime = Double(response["start_time"]) ?? 0.0
+                let endTime = Double(response["end_time"]) ?? 0.0
                 
                 if !wavPath.isEmpty {
                     let cleanLabel = speakerLabel.isEmpty ? "Unknown Speaker" : speakerLabel
+                    print("[Swift Bridge] Speech segment detected: wavPath=\(wavPath), speaker=\(cleanLabel), start=\(startTime), end=\(endTime)")
+                    
+                    self.lock.lock()
+                    self.pendingSegments.append(PendingSegment(startTime: startTime, endTime: endTime, speaker: cleanLabel))
+                    self.lock.unlock()
+                    
                     self.enqueueSpeakerLabel(cleanLabel)
                     self.whisperWorker?.transcribe(wavPath: wavPath)
                 }
@@ -256,6 +496,18 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                     self.isVoiceActive = isSpeaking
                 }
             }
+            if currentChunk % 50 == 0 || currentChunk <= 5 {
+                print("[Swift Bridge] pushAudioSamples queue: Chunk #\(currentChunk) processing completed")
+            }
+        }
+    }
+    
+    deinit {
+        print("[PythonBridge] deinit called. Shutting down worker and thread.")
+        whisperWorker?.stop()
+        pythonThread.stop()
+        if let handle = pythonLibHandle {
+            dlclose(handle)
         }
     }
 }
@@ -264,6 +516,8 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
 
 class WhisperWorker: @unchecked Sendable {
     private let projectPath: String
+    private let modelName: String
+    private let deviceType: String
     private var process: Process?
     private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
@@ -272,8 +526,10 @@ class WhisperWorker: @unchecked Sendable {
     
     var onTranscriptionReceived: (@Sendable (String) -> Void)?
     
-    init(projectPath: String) {
+    init(projectPath: String, modelName: String, deviceType: String) {
         self.projectPath = projectPath
+        self.modelName = modelName
+        self.deviceType = deviceType
         startSubprocess()
     }
     
@@ -289,7 +545,7 @@ class WhisperWorker: @unchecked Sendable {
         self.stderrPipe = stderrPipe
         
         process.executableURL = URL(fileURLWithPath: "\(projectPath)/.venv/bin/python")
-        process.arguments = ["\(projectPath)/transcribe_worker.py"]
+        process.arguments = ["-u", "\(projectPath)/transcribe_worker.py", "--model", modelName, "--device", deviceType]
         
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
@@ -378,4 +634,15 @@ class WhisperWorker: @unchecked Sendable {
     deinit {
         stop()
     }
+}
+
+struct WhisperResponse: Codable {
+    let text: String
+    let segments: [WhisperSegment]
+}
+
+struct WhisperSegment: Codable {
+    let start: Double
+    let end: Double
+    let text: String
 }

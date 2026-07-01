@@ -12,6 +12,7 @@ import AVFoundation
 class AudioDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let onAudioSamples: @Sendable ([Float]) -> Void
     private var printedFormat = false
+    private var sampleBlockCount = 0
     
     init(onAudioSamples: @escaping @Sendable ([Float]) -> Void) {
         self.onAudioSamples = onAudioSamples
@@ -78,6 +79,15 @@ class AudioDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
         
         if !samples.isEmpty {
+            // Apply 6.0x gain boost to ensure quiet microphones register clearly with Silero VAD
+            let gain: Float = 6.0
+            samples = samples.map { max(-1.0, min(1.0, $0 * gain)) }
+            
+            sampleBlockCount += 1
+            if sampleBlockCount % 100 == 0 || sampleBlockCount <= 5 {
+                let maxVal = samples.map(abs).max() ?? 0.0
+                print("[Audio Delegate] Block #\(sampleBlockCount) processed \(samples.count) samples. Max amplitude: \(String(format: "%.5f", maxVal)) (Gain boosted)")
+            }
             onAudioSamples(samples)
         }
     }
