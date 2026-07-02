@@ -16,7 +16,7 @@ class AVCaptureEngine: NSObject, ObservableObject {
     @Published var fps: Double = 0.0
     @Published var lastLog: String = ""
     @Published var audioLevel: Float = 0.0
-    @Published var videoDelay: Double = 4.0 {
+    @Published var videoDelay: Double = 6.0 {
         didSet {
             pipelineRefs.videoDelay = videoDelay
         }
@@ -362,7 +362,7 @@ private final class PipelineReferences: @unchecked Sendable {
     private let lock = NSLock()
     private weak var _faceEngine: VisionFaceEngine?
     private weak var _pythonBridge: PythonBridge?
-    private var _videoDelay: Double = 4.0
+    private var _videoDelay: Double = 6.0
     private var _delayedFrames: [DelayedFrame] = []
     
     var videoDelay: Double {
@@ -414,12 +414,21 @@ private final class PipelineReferences: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         
-        // Limit buffer memory growth to prevent leaks under extreme stalls (max 150 frames)
-        while _delayedFrames.count > 150 {
+        // Limit buffer memory growth to prevent leaks under extreme stalls (max 300 frames)
+        while _delayedFrames.count > 300 {
             _ = _delayedFrames.removeFirst()
         }
         
         let now = Date()
+        
+        // Stale frame purging: if the oldest frame is older than 1.5x of the delay, it means
+        // the stream has stalled or the window was reopened. Clear the queue to start fresh.
+        if let first = _delayedFrames.first, now.timeIntervalSince(first.timestamp) > (_videoDelay * 1.5) {
+            print("[AVCaptureEngine] Stale frames detected (oldest is \(now.timeIntervalSince(first.timestamp))s old). Clearing delay buffer queue.")
+            _delayedFrames.removeAll()
+            return nil
+        }
+        
         if let first = _delayedFrames.first, now.timeIntervalSince(first.timestamp) >= _videoDelay {
             return _delayedFrames.removeFirst()
         }
@@ -523,7 +532,7 @@ class PixelBufferCloner: @unchecked Sendable {
             poolHeight = height
             poolFormat = format
             
-            let poolAttrs = [kCVPixelBufferPoolMinimumBufferCountKey as String: 150] as CFDictionary
+            let poolAttrs = [kCVPixelBufferPoolMinimumBufferCountKey as String: 300] as CFDictionary
             let bufferAttrs = [
                 kCVPixelBufferPixelFormatTypeKey as String: format,
                 kCVPixelBufferWidthKey as String: width,

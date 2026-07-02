@@ -78,12 +78,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
     private var activeSubtitles: [SubtitleSegment] = []
     private var speakerMapping: [String: String] = [:]
     
-    private struct PendingSegment {
-        let startTime: Double
-        let endTime: Double
-        let speaker: String
-    }
-    private var pendingSegments: [PendingSegment] = []
+
     
     private let pythonThread = PythonThread()
     private let lock = NSLock()
@@ -99,9 +94,24 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         
+        // Debug logging for subtitle query timing and labeling
+        if !activeSubtitles.isEmpty {
+            let looseMatches = activeSubtitles.filter {
+                timestamp >= ($0.startTime - 2.0) && timestamp <= ($0.endTime + 3.0)
+            }
+            if !looseMatches.isEmpty {
+                print("[Subtitle Query Debug] timestamp=\(timestamp), querySpeaker='\(speaker)'. Loose time matches:")
+                for m in looseMatches {
+                    let timeMatch = timestamp >= (m.startTime - 0.2) && timestamp <= (m.endTime + 1.5)
+                    let speakerMatch = speaker.isEmpty || m.speaker == speaker
+                    print("  - [Match=\(timeMatch && speakerMatch) (Time=\(timeMatch), Spk=\(speakerMatch))] Text='\(m.text)', segmentSpeaker='\(m.speaker)', start=\(m.startTime), end=\(m.endTime)")
+                }
+            }
+        }
+        
         // If speaker name is empty (full frame view), return text with speaker prefix
         if speaker.isEmpty {
-            if let match = activeSubtitles.first(where: { timestamp >= ($0.startTime - 0.2) && timestamp <= ($0.endTime + 0.8) }) {
+            if let match = activeSubtitles.first(where: { timestamp >= ($0.startTime - 0.2) && timestamp <= ($0.endTime + 1.5) }) {
                 return "[\(match.speaker)]: \(match.text)"
             }
             return ""
@@ -111,7 +121,7 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         if let match = activeSubtitles.first(where: { 
             $0.speaker == speaker && 
             timestamp >= ($0.startTime - 0.2) && 
-            timestamp <= ($0.endTime + 0.8) 
+            timestamp <= ($0.endTime + 1.5) 
         }) {
             return match.text
         }
@@ -128,7 +138,6 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         lock.lock()
         let callback = whisperWorker?.onTranscriptionReceived
         whisperWorker?.stop()
-        pendingSegments.removeAll()
         
         let deviceStr = useCPU ? "cpu" : "gpu"
         print("[PythonBridge] Restarting Whisper worker: model=\(modelName), device=\(deviceStr)")
@@ -279,15 +288,20 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                     worker.onTranscriptionReceived = { [weak self] rawText in
                         guard let self = self else { return }
                         
-                        guard let jsonData = rawText.data(using: .utf8),
-                              let response = try? JSONDecoder().decode(MultiSpeakerWhisperResponse.self, from: jsonData) else {
-                            print("[PythonBridge] Error: Failed to parse MultiSpeakerWhisperResponse from: \(rawText)")
+                        guard let jsonData = rawText.data(using: .utf8) else {
+                            print("[PythonBridge] Error: Failed to convert rawText to UTF8 data.")
                             return
                         }
                         
-                        self.lock.lock()
-                        let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
-                        self.lock.unlock()
+                        let response: MultiSpeakerWhisperResponse
+                        do {
+                            response = try JSONDecoder().decode(MultiSpeakerWhisperResponse.self, from: jsonData)
+                        } catch {
+                            print("[PythonBridge] JSON Decoding error: \(error) for rawText: \(rawText)")
+                            return
+                        }
+                        
+                        print("[Subtitle Callback Debug] Received callback. start_time=\(response.start_time), end_time=\(response.end_time)")
                         
                         var finalFullText = ""
                         var segmentsToRegister: [(text: String, start: Double, end: Double, speaker: String)] = []
@@ -300,15 +314,22 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                                 finalFullText += "\n[\(res.speaker)]: \(res.text)"
                             }
                             
-                            if let seg = pending {
-                                if res.segments.isEmpty {
-                                    segmentsToRegister.append((text: res.text, start: seg.startTime, end: seg.endTime, speaker: res.speaker))
-                                } else {
-                                    for subSeg in res.segments {
-                                        let absStart = seg.startTime + subSeg.start
-                                        let absEnd = seg.startTime + subSeg.end
-                                        segmentsToRegister.append((text: subSeg.text, start: absStart, end: absEnd, speaker: res.speaker))
-                                    }
+                            if res.segments.isEmpty {
+                                let absStart = response.start_time
+                                let absEnd = response.end_time
+                                print("  - [Subtitle Callback Debug] Registering segment for \(res.speaker): '\(res.text)' at range [\(absStart), \(absEnd)]")
+                                segmentsToRegister.append((text: res.text, start: absStart, end: absEnd, speaker: res.speaker))
+                            } else {
+                                let maxDuration = response.end_time - response.start_time
+                                for subSeg in res.segments {
+                                    if subSeg.text.isEmpty { continue }
+                                    let clampedStart = min(max(subSeg.start, 0.0), maxDuration)
+                                    let clampedEnd = min(max(subSeg.end, clampedStart), maxDuration)
+                                    
+                                    let absStart = response.start_time + clampedStart
+                                    let absEnd = response.start_time + clampedEnd
+                                    print("  - [Subtitle Callback Debug] Registering sub-segment for \(res.speaker): '\(subSeg.text)' at range [\(absStart), \(absEnd)]")
+                                    segmentsToRegister.append((text: subSeg.text, start: absStart, end: absEnd, speaker: res.speaker))
                                 }
                             }
                         }
@@ -531,19 +552,24 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                     }
                 }
                 
+                let runSeparation = Bool(response["run_separation"]) ?? false
+                
                 if !wavPath.isEmpty {
                     let cleanLabel = speakerLabel.isEmpty ? "Unknown Speaker" : speakerLabel
-                    print("[Swift Bridge] Speech segment detected: wavPath=\(wavPath), speaker=\(cleanLabel), start=\(startTime), end=\(endTime)")
+                    print("[Swift Bridge] Speech segment detected: wavPath=\(wavPath), speaker=\(cleanLabel), start=\(startTime), end=\(endTime), runSeparation=\(runSeparation)")
                     
                     self.lock.lock()
-                    self.pendingSegments.append(PendingSegment(startTime: startTime, endTime: endTime, speaker: cleanLabel))
                     let mappingCopy = self.speakerMapping
                     self.lock.unlock()
                     
                     let job: [String: Any] = [
                         "wav_path": wavPath,
                         "face_envelopes": faceEnvelopes,
-                        "speaker_mapping": mappingCopy
+                        "speaker_mapping": mappingCopy,
+                        "run_separation": runSeparation,
+                        "start_time": startTime,
+                        "end_time": endTime,
+                        "detected_speaker": cleanLabel
                     ]
                     
                     if let jsonData = try? JSONSerialization.data(withJSONObject: job),
@@ -704,6 +730,8 @@ struct MultiSpeakerWhisperResult: Codable {
 
 struct MultiSpeakerWhisperResponse: Codable {
     let results: [MultiSpeakerWhisperResult]
+    let start_time: Double
+    let end_time: Double
 }
 
 struct WhisperSegment: Codable {
