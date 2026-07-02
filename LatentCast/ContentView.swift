@@ -440,6 +440,9 @@ struct ContentView: View {
                 appendLog(logMsg)
             }
         }
+        .onReceive(pythonBridge.$isVoiceActive) { isActive in
+            faceEngine.isVoiceActive = isActive
+        }
         .onReceive(pythonBridge.$liveTranscription) { transcription in
             if !transcription.isEmpty {
                 appendLog("[Transcription] \(transcription)")

@@ -8,6 +8,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import CoreImage
 
 @MainActor
 class AVCaptureEngine: NSObject, ObservableObject {
@@ -144,9 +145,9 @@ class AVCaptureEngine: NSObject, ObservableObject {
                         return
                     }
                     
-                    // 2. Fetch the current face bounding box (fall back to first tracked face if silent)
+                    // 2. Fetch the current active speaker bounding boxes and UUIDs via spatial association tracking
                     let tracks = fEngine?.safeActiveTracks ?? []
-                    let currentFaceBox = (tracks.first(where: { $0.isActiveSpeaker }) ?? tracks.first)?.boundingBox
+                    let activeSpeakers = self.pipelineRefs.updateActiveSpeakers(with: tracks)
                     
                     // 3. Deep-copy the pixel buffer from our reusable cloner pool to avoid memory allocations
                     guard let clonedBuffer = self.cloner.clone(sendableBuffer.buffer) else {
@@ -156,7 +157,7 @@ class AVCaptureEngine: NSObject, ObservableObject {
                     
                     // 4. Enqueue in the delay buffer
                     let now = Date()
-                    let delayedFrame = DelayedFrame(pixelBuffer: clonedBuffer, faceBoundingBox: currentFaceBox, timestamp: now)
+                    let delayedFrame = DelayedFrame(pixelBuffer: clonedBuffer, activeSpeakers: activeSpeakers, timestamp: now)
                     
                     self.pipelineRefs.appendFrame(delayedFrame)
                     let frameToProcess = self.pipelineRefs.popFrameIfReady()
@@ -167,19 +168,41 @@ class AVCaptureEngine: NSObject, ObservableObject {
                         return
                     }
                     
-                    // 5. Fetch the subtitle matching the frame's capture timestamp (frame-level synchronization)
+                    // 5. Fetch subtitles specifically for the speakers at the target frame's timestamp
+                    var leftSubtitle = ""
+                    var rightSubtitle = ""
+                    
+                    let pyBridge = self.pythonBridge
                     let frameTimestamp = targetFrame.timestamp.timeIntervalSince1970
-                    let subtitle = self.pythonBridge?.subtitle(for: frameTimestamp) ?? ""
+                    
+                    if targetFrame.activeSpeakers.count == 1 {
+                        let id = targetFrame.activeSpeakers[0].id
+                        let speakerLabel = pyBridge?.speakerLabel(for: id.uuidString) ?? ""
+                        leftSubtitle = pyBridge?.subtitle(for: frameTimestamp, speaker: speakerLabel) ?? ""
+                    } else if targetFrame.activeSpeakers.count == 2 {
+                        let sorted = targetFrame.activeSpeakers.sorted { $0.box.origin.x < $1.box.origin.x }
+                        
+                        let leftId = sorted[0].id
+                        let leftSpeakerLabel = pyBridge?.speakerLabel(for: leftId.uuidString) ?? ""
+                        leftSubtitle = pyBridge?.subtitle(for: frameTimestamp, speaker: leftSpeakerLabel) ?? ""
+                        
+                        let rightId = sorted[1].id
+                        let rightSpeakerLabel = pyBridge?.speakerLabel(for: rightId.uuidString) ?? ""
+                        rightSubtitle = pyBridge?.subtitle(for: frameTimestamp, speaker: rightSpeakerLabel) ?? ""
+                    } else {
+                        leftSubtitle = pyBridge?.subtitle(for: frameTimestamp, speaker: "") ?? ""
+                    }
                     
                     // 6. Pass the delayed frame to the compositor
                     if let output = self.compositor.processFrame(
                         pixelBuffer: targetFrame.pixelBuffer,
-                        activeSpeakerBox: targetFrame.faceBoundingBox,
-                        subtitle: subtitle
+                        activeSpeakers: targetFrame.activeSpeakers,
+                        leftSubtitle: leftSubtitle,
+                        rightSubtitle: rightSubtitle
                     ) {
-                        let cgImage = output.cgImage
+                        let sendableFrame = SendablePixelBuffer(buffer: output.pixelBuffer)
                         Task { @MainActor in
-                            CleanFeedCoordinator.shared.processedFrame = cgImage
+                            CleanFeedCoordinator.shared.processedFrame = sendableFrame
                         }
                         
                         // Send to Python Virtual Camera
@@ -330,7 +353,7 @@ class AudioHandler: @unchecked Sendable {
 
 fileprivate struct DelayedFrame {
     let pixelBuffer: CVPixelBuffer
-    let faceBoundingBox: CGRect?
+    let activeSpeakers: [(id: UUID, box: CGRect)]
     let timestamp: Date
 }
 
@@ -402,15 +425,92 @@ private final class PipelineReferences: @unchecked Sendable {
         }
         return nil
     }
+    
+    // Stateful active speakers
+    private var activeSpeakers: [ActiveSpeakerState] = []
+    
+    func updateActiveSpeakers(with tracks: [ActiveFaceInfo]) -> [(id: UUID, box: CGRect)] {
+        let now = Date()
+        
+        // Helper to calculate centroid distance
+        func distance(_ p1: CGPoint, _ p2: CGPoint) -> CGFloat {
+            let dx = p1.x - p2.x
+            let dy = p1.y - p2.y
+            return sqrt(dx*dx + dy*dy)
+        }
+        
+        // 1. Match tracks to existing speakers spatially
+        for track in tracks {
+            let trackCentroid = CGPoint(x: track.boundingBox.midX, y: track.boundingBox.midY)
+            
+            var matchedIndex: Int? = nil
+            var bestDistance = CGFloat.infinity
+            
+            for i in 0..<activeSpeakers.count {
+                let speakerCentroid = CGPoint(x: activeSpeakers[i].lastKnownBox.midX, y: activeSpeakers[i].lastKnownBox.midY)
+                let dist = distance(trackCentroid, speakerCentroid)
+                if dist < bestDistance && dist < 0.25 {
+                    bestDistance = dist
+                    matchedIndex = i
+                }
+            }
+            
+            if let idx = matchedIndex {
+                // Update existing speaker
+                activeSpeakers[idx].lastKnownBox = track.boundingBox
+                activeSpeakers[idx].lastTimeDetected = now
+                if track.isActiveSpeaker {
+                    activeSpeakers[idx].lastTimeSpoke = now
+                }
+            } else if track.isActiveSpeaker {
+                // Add new speaker
+                let newSpeaker = ActiveSpeakerState(
+                    id: track.id,
+                    lastKnownBox: track.boundingBox,
+                    lastTimeDetected: now,
+                    lastTimeSpoke: now
+                )
+                activeSpeakers.append(newSpeaker)
+            }
+        }
+        
+        // 2. Clean up stale speakers (not detected for 1.2s OR stopped speaking for 3.0s)
+        activeSpeakers.removeAll { speaker in
+            let notDetected = now.timeIntervalSince(speaker.lastTimeDetected) > 1.2
+            let stoppedSpeaking = now.timeIntervalSince(speaker.lastTimeSpoke) > 3.0
+            return notDetected || stoppedSpeaking
+        }
+        
+        // 3. Fallback: if no active speakers, but 1 face is currently tracked, keep focus on them
+        if activeSpeakers.isEmpty {
+            if tracks.count == 1 {
+                return [(id: tracks[0].id, box: tracks[0].boundingBox)]
+            }
+            return []
+        }
+        
+        return activeSpeakers.map { ($0.id, $0.lastKnownBox) }
+    }
 }
 
-/// Helper class to clone/deep-copy a CVPixelBuffer using a reusable CVPixelBufferPool to avoid high-frequency allocations
+fileprivate struct ActiveSpeakerState {
+    var id: UUID
+    var lastKnownBox: CGRect
+    var lastTimeDetected: Date
+    var lastTimeSpoke: Date
+}
+
+/// Helper class to clone/deep-copy a CVPixelBuffer using a GPU-accelerated CIContext to avoid high-frequency CPU locks and copies
 class PixelBufferCloner: @unchecked Sendable {
     private let lock = NSLock()
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
     private var poolFormat: OSType = 0
+    private let ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .priorityRequestLow: true
+    ])
     
     func clone(_ src: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(src)
@@ -419,24 +519,25 @@ class PixelBufferCloner: @unchecked Sendable {
         
         lock.lock()
         if pool == nil || poolWidth != width || poolHeight != height || poolFormat != format {
-            // Re-create pool if buffer dimensions or format changes dynamically
             poolWidth = width
             poolHeight = height
             poolFormat = format
             
-            let poolAttrs = [kCVPixelBufferPoolMinimumBufferCountKey as String: 120] as CFDictionary
+            let poolAttrs = [kCVPixelBufferPoolMinimumBufferCountKey as String: 150] as CFDictionary
             let bufferAttrs = [
                 kCVPixelBufferPixelFormatTypeKey as String: format,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferCGImageCompatibilityKey as String: true
             ] as CFDictionary
             
             var newPool: CVPixelBufferPool? = nil
             let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, bufferAttrs, &newPool)
             if status == kCVReturnSuccess {
                 pool = newPool
-                print("[PixelBufferCloner] Re-created reusable CVPixelBufferPool: \(width)x\(height), format: \(format)")
+                print("[PixelBufferCloner] Re-created GPU-compatible CVPixelBufferPool: \(width)x\(height)")
             } else {
                 print("[PixelBufferCloner] Failed to create CVPixelBufferPool status: \(status)")
                 lock.unlock()
@@ -454,29 +555,9 @@ class PixelBufferCloner: @unchecked Sendable {
         let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, currentPool, &dst)
         guard status == kCVReturnSuccess, let output = dst else { return nil }
         
-        CVPixelBufferLockBaseAddress(src, .readOnly)
-        CVPixelBufferLockBaseAddress(output, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(src, .readOnly)
-            CVPixelBufferUnlockBaseAddress(output, [])
-        }
-        
-        let planeCount = CVPixelBufferGetPlaneCount(src)
-        if planeCount == 0 {
-            if let srcAddr = CVPixelBufferGetBaseAddress(src),
-               let dstAddr = CVPixelBufferGetBaseAddress(output) {
-                let bytes = CVPixelBufferGetBytesPerRow(src) * CVPixelBufferGetHeight(src)
-                memcpy(dstAddr, srcAddr, bytes)
-            }
-        } else {
-            for plane in 0..<planeCount {
-                if let srcAddr = CVPixelBufferGetBaseAddressOfPlane(src, plane),
-                   let dstAddr = CVPixelBufferGetBaseAddressOfPlane(output, plane) {
-                    let bytes = CVPixelBufferGetBytesPerRowOfPlane(src, plane) * CVPixelBufferGetHeightOfPlane(src, plane)
-                    memcpy(dstAddr, srcAddr, bytes)
-                }
-            }
-        }
+        // GPU copy via Core Image (no CPU cache synchronization or lock overhead)
+        let ciImage = CIImage(cvPixelBuffer: src)
+        ciContext.render(ciImage, to: output)
         return output
     }
 }

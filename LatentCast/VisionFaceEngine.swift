@@ -25,6 +25,7 @@ private struct FaceTrack: Identifiable, Sendable {
     var lastCentroid: CGPoint
     var lastActiveTime: Date
     var lipHeights: [CGFloat]
+    var lastSpeakTime: Date?
 }
 
 class VisionFaceEngine: ObservableObject, @unchecked Sendable {
@@ -39,10 +40,25 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
     // Internal tracking parameters (protected by lock)
     private var tracks: [FaceTrack] = []
     private var safeTracksCache: [ActiveFaceInfo] = []
-    private let maxHistoryLength = 60    // ~1s of frames at 30fps
-    private let trackingThreshold: CGFloat = 0.15 // Centroid distance threshold
+    private let maxHistoryLength = 15    // Shortened for faster responsiveness (~1.5s at 10fps)
+    private let trackingThreshold: CGFloat = 0.25 // Centroid distance matching threshold
     private let trackTimeout: TimeInterval = 1.5   // Delete track if inactive for > 1.5s
-    private var speakThresholdInternal: Double = 0.0003   // Variance above this = speaking
+    private var speakThresholdInternal: Double = 0.00015   // Lowered threshold (now VAD-gated)
+    private let speakDebounceDuration: TimeInterval = 3.0  // 3-second debounce hangover
+    private var isVoiceActiveInternal = false
+    
+    var isVoiceActive: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return isVoiceActiveInternal
+        }
+        set {
+            lock.lock()
+            isVoiceActiveInternal = newValue
+            lock.unlock()
+        }
+    }
     
     // Thread-safe public property for adjusting sensitivity from the UI
     var speakThreshold: Double {
@@ -161,14 +177,39 @@ class VisionFaceEngine: ObservableObject, @unchecked Sendable {
                     id: trackId,
                     lastCentroid: centroid,
                     lastActiveTime: now,
-                    lipHeights: rollingHeights
+                    lipHeights: rollingHeights,
+                    lastSpeakTime: nil
                 )
                 tracks.append(newTrack)
             }
             
-            // 4. Calculate temporal lip variance
+            // 4. Calculate temporal lip variance and speaking state with neural VAD gate
             let variance = calculateVariance(rollingHeights)
-            let isSpeaking = variance > speakThresholdInternal
+            let rawSpeaking = self.isVoiceActiveInternal && (variance > speakThresholdInternal)
+            
+            // Update last speak time
+            if rawSpeaking {
+                if let idx = matchedIndex {
+                    tracks[idx].lastSpeakTime = now
+                } else if var lastTrack = tracks.last, lastTrack.id == trackId {
+                    lastTrack.lastSpeakTime = now
+                    tracks[tracks.count - 1] = lastTrack
+                }
+            }
+            
+            var isSpeaking = rawSpeaking
+            if !rawSpeaking {
+                let lastSpeak: Date?
+                if let idx = matchedIndex {
+                    lastSpeak = tracks[idx].lastSpeakTime
+                } else {
+                    lastSpeak = tracks.last?.lastSpeakTime
+                }
+                
+                if let lastSpeakDate = lastSpeak, now.timeIntervalSince(lastSpeakDate) < speakDebounceDuration {
+                    isSpeaking = true
+                }
+            }
             
             var landmarksDict: [String: [CGPoint]] = [:]
             if let landmarks = face.landmarks {

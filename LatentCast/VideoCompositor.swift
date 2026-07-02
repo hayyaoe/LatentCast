@@ -14,7 +14,6 @@ import CoreText
 
 struct CompositorOutput: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
-    let cgImage: CGImage
 }
 
 class VideoCompositor: @unchecked Sendable {
@@ -28,13 +27,32 @@ class VideoCompositor: @unchecked Sendable {
     // Lerp state for smooth panning/zooming (protected by local lock)
     private let lock = NSLock()
     private var isInitialized = false
-    private var currentCropRect = CGRect(x: 0, y: 0, width: 1920, height: 1080)
-    private var targetCropRect = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    
+    // Smooth split-screen divider position (defaults to full width)
+    private var currentSplitX: CGFloat = 1920
+    private var targetSplitX: CGFloat = 1920
+    
+    // Smooth crop rects for left and right panels
+    private var currentCropLeft = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    private var targetCropLeft = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    
+    private var currentCropRight = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    private var targetCropRight = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    
+    // Track current mode for smooth transitions
+    private var currentMode: ZoomMode = .fullFrame
+    
     var lerpAlpha: CGFloat = 0.08  // Smoothing factor (approx 300ms transition time)
     
     private var pixelBufferPool: CVPixelBufferPool?
-    private var poolWidth = 1920
-    private var poolHeight = 1080
+    private let poolWidth = 1920
+    private let poolHeight = 1080
+    
+    enum ZoomMode {
+        case fullFrame      // 0 or 3+ speakers
+        case singleSpeaker  // 1 speaker
+        case dualSpeaker    // 2 speakers
+    }
     
     init() {
         setupPixelBufferPool()
@@ -59,91 +77,206 @@ class VideoCompositor: @unchecked Sendable {
         }
     }
     
-    func processFrame(pixelBuffer: CVPixelBuffer, activeSpeakerBox: CGRect?, subtitle: String) -> CompositorOutput? {
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+    /// Calculates a crop rect centered on a face bounding box with padding matching the target aspect ratio
+    /// `speakerBox` is in normalized Apple Vision coordinates (0,0 = bottom-left, range [0,1])
+    private func cropRect(for speakerBox: CGRect, frameWidth: CGFloat, frameHeight: CGFloat, targetAspect: CGFloat) -> CGRect {
+        let faceX = speakerBox.origin.x * frameWidth
+        let faceY = speakerBox.origin.y * frameHeight
+        let faceW = speakerBox.size.width * frameWidth
+        let faceH = speakerBox.size.height * frameHeight
+        
+        // Pad the crop window: height = 3.2x face height
+        var cropH = min(frameHeight, faceH * 3.2)
+        var cropW = cropH * targetAspect
+        
+        // Prevent crop box from being narrower than the face itself
+        if cropW < faceW {
+            cropW = faceW
+            cropH = cropW / targetAspect
+        }
+        
+        // If crop window is too wide for the frame, scale down cropH to fit cropW
+        if cropW > frameWidth {
+            cropW = frameWidth
+            cropH = cropW / targetAspect
+        }
+        
+        // If crop window is too tall for the frame, scale down cropW to fit cropH
+        if cropH > frameHeight {
+            cropH = frameHeight
+            cropW = cropH * targetAspect
+        }
+        
+        // Center crop around the face
+        var cropX = faceX + (faceW / 2.0) - (cropW / 2.0)
+        var cropY = faceY + (faceH / 2.0) - (cropH / 2.0)
+        
+        // Clamp within frame bounds
+        cropX = max(0, min(frameWidth - cropW, cropX))
+        cropY = max(0, min(frameHeight - cropH, cropY))
+        
+        return CGRect(x: cropX, y: cropY, width: cropW, height: cropH)
+    }
+    
+    /// Applies lerp interpolation to smoothly transition between crop rects
+    private func lerp(_ current: inout CGRect, toward target: CGRect) {
+        current.origin.x += lerpAlpha * (target.origin.x - current.origin.x)
+        current.origin.y += lerpAlpha * (target.origin.y - current.origin.y)
+        current.size.width += lerpAlpha * (target.size.width - current.size.width)
+        current.size.height += lerpAlpha * (target.size.height - current.size.height)
+    }
+    
+    /// Crops, translates, and scales a CIImage region to a target pixel size
+    private func cropAndScale(_ source: CIImage, rect: CGRect, targetWidth: CGFloat, targetHeight: CGFloat) -> CIImage {
+        var cropped = source.cropped(to: rect)
+        let translation = CGAffineTransform(translationX: -cropped.extent.origin.x, y: -cropped.extent.origin.y)
+        cropped = cropped.transformed(by: translation)
+        
+        let extentWidth = cropped.extent.width > 0 ? cropped.extent.width : 1
+        let extentHeight = cropped.extent.height > 0 ? cropped.extent.height : 1
+        let scaleX = targetWidth / extentWidth
+        let scaleY = targetHeight / extentHeight
+        cropped = cropped.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        
+        return cropped.cropped(to: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+    }
+    
+    func processFrame(
+        pixelBuffer: CVPixelBuffer,
+        activeSpeakers: [(id: UUID, box: CGRect)],
+        leftSubtitle: String,
+        rightSubtitle: String
+    ) -> CompositorOutput? {
+        let width = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let height = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
         
         let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let fullFrameRect = CGRect(x: 0, y: 0, width: width, height: height)
         
         lock.lock()
-        // 0. Initialize crop rects dynamically on first frame based on actual frame size
+        
+        // Initialize crop rects on first frame
         if !isInitialized {
-            currentCropRect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
-            targetCropRect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+            currentCropLeft = fullFrameRect
+            targetCropLeft = fullFrameRect
+            currentCropRight = fullFrameRect
+            targetCropRight = fullFrameRect
+            currentSplitX = 1920
+            targetSplitX = 1920
             isInitialized = true
-            print("[VideoCompositor] Success: Dynamic crop rects initialized to frame size: \(width)x\(height)")
+            print("[VideoCompositor] Dynamic crop rects initialized to frame size: \(Int(width))x\(Int(height))")
         }
         
-        // 1. Calculate Target Crop Box based on Active Speaker
-        if let speakerBox = activeSpeakerBox {
-            // Vision coordinates have origin at bottom-left, range [0, 1]
-            let faceX = speakerBox.origin.x * CGFloat(width)
-            let faceY = speakerBox.origin.y * CGFloat(height)
-            let faceW = speakerBox.size.width * CGFloat(width)
-            let faceH = speakerBox.size.height * CGFloat(height)
+        // Determine zoom mode
+        let mode: ZoomMode
+        switch activeSpeakers.count {
+        case 1: mode = .singleSpeaker
+        case 2: mode = .dualSpeaker
+        default: mode = .fullFrame  // 0 or 3+ speakers
+        }
+        
+        var modeChanged = false
+        if mode != currentMode {
+            currentMode = mode
+            modeChanged = true
+        }
+        
+        // Update target split and crops
+        switch mode {
+        case .singleSpeaker:
+            targetSplitX = 1920
+            currentSplitX = targetSplitX
             
-            // Pad the crop window to make it a pleasant portrait/landscape shot
-            // We want the height of the crop to be 3.2x of the face height
-            var cropH = min(CGFloat(height), faceH * 3.2)
-            var cropW = cropH * (16.0 / 9.0)  // Maintain 16:9 ratio
+            let speaker = activeSpeakers[0].box
+            let leftAspect = currentSplitX / 1080.0
+            targetCropLeft = cropRect(for: speaker, frameWidth: width, frameHeight: height, targetAspect: leftAspect)
             
-            // Guard aspect ratio against narrow bounds (e.g. 4:3 inputs or side borders)
-            if cropW > CGFloat(width) {
-                cropW = CGFloat(width)
-                cropH = cropW * (9.0 / 16.0)
-            }
+            // Right panel is unused, target crop goes to full frame
+            targetCropRight = fullFrameRect
             
-            // Center the crop window around the face
-            var cropX = faceX + (faceW / 2.0) - (cropW / 2.0)
-            var cropY = faceY + (faceH / 2.0) - (cropH / 2.0)
+        case .dualSpeaker:
+            targetSplitX = 960
+            currentSplitX = targetSplitX
             
-            // Keep bounds within original frame
-            cropX = max(0, min(CGFloat(width) - cropW, cropX))
-            cropY = max(0, min(CGFloat(height) - cropH, cropY))
+            let sorted = activeSpeakers.sorted { $0.box.origin.x < $1.box.origin.x }
             
-            targetCropRect = CGRect(x: cropX, y: cropY, width: cropW, height: cropH)
+            let leftAspect = currentSplitX / 1080.0
+            targetCropLeft = cropRect(for: sorted[0].box, frameWidth: width, frameHeight: height, targetAspect: leftAspect)
+            
+            let rightW = max(50.0, 1920.0 - currentSplitX)
+            let rightAspect = rightW / 1080.0
+            targetCropRight = cropRect(for: sorted[1].box, frameWidth: width, frameHeight: height, targetAspect: rightAspect)
+            
+        case .fullFrame:
+            targetSplitX = 1920
+            currentSplitX = targetSplitX
+            
+            targetCropLeft = fullFrameRect
+            targetCropRight = fullFrameRect
+        }
+        
+        if modeChanged {
+            currentCropLeft = targetCropLeft
+            currentCropRight = targetCropRight
         } else {
-            // No active speaker -> zoom back to full frame
-            targetCropRect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+            // Lerp crops smoothly for panning/zooming inside panels
+            lerp(&currentCropLeft, toward: targetCropLeft)
+            lerp(&currentCropRight, toward: targetCropRight)
         }
         
-        // 2. Perform Lerp Interpolation for smooth panning/zooming
-        currentCropRect.origin.x += lerpAlpha * (targetCropRect.origin.x - currentCropRect.origin.x)
-        currentCropRect.origin.y += lerpAlpha * (targetCropRect.origin.y - currentCropRect.origin.y)
-        currentCropRect.size.width += lerpAlpha * (targetCropRect.size.width - currentCropRect.size.width)
-        currentCropRect.size.height += lerpAlpha * (targetCropRect.size.height - currentCropRect.size.height)
+        let activeSplitX = currentSplitX
+        let activeCropLeft = currentCropLeft
+        let activeCropRight = currentCropRight
         
-        let activeCropRect = currentCropRect
         lock.unlock()
         
-        // 3. Crop and Scale back to 1080p
-        var croppedImage = sourceImage.cropped(to: activeCropRect)
+        // Render panels
+        let leftW = max(1.0, activeSplitX)
+        let rightW = max(1.0, 1920.0 - activeSplitX)
         
-        // Translate origin to (0,0) before scaling so scale transform aligns correctly
-        let translation = CGAffineTransform(translationX: -croppedImage.extent.origin.x, y: -croppedImage.extent.origin.y)
-        croppedImage = croppedImage.transformed(by: translation)
+        // Left Panel
+        let leftPanel = cropAndScale(sourceImage, rect: activeCropLeft, targetWidth: leftW, targetHeight: 1080)
+        var finalImage = leftPanel
         
-        // Scale transform to 1920x1080
-        let scaleX = CGFloat(poolWidth) / croppedImage.extent.width
-        let scaleY = CGFloat(poolHeight) / croppedImage.extent.height
-        croppedImage = croppedImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        
-        // Clean extent to avoid infinite bounds errors
-        let scaledExtent = CGRect(x: 0, y: 0, width: CGFloat(poolWidth), height: CGFloat(poolHeight))
-        croppedImage = croppedImage.cropped(to: scaledExtent)
-        
-        // 4. Burn Subtitles (translucent background text strip at bottom)
-        var finalImage = croppedImage
-        if let subtitleCG = subtitleRenderer.render(text: subtitle) {
-            var subtitleCI = CIImage(cgImage: subtitleCG)
-            // Flip vertically to align with Core Image's bottom-left origin
-            let flipTransform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -CGFloat(subtitleCG.height))
-            subtitleCI = subtitleCI.transformed(by: flipTransform)
-            // Composite text overlay on top of scaled cropped frame (sits at bottom-left naturally)
-            finalImage = subtitleCI.composited(over: croppedImage)
+        // Render left subtitle directly onto the left panel
+        if let leftCG = subtitleRenderer.render(text: leftSubtitle, width: Int(leftW)) {
+            var leftCI = CIImage(cgImage: leftCG)
+            let flipTransform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -CGFloat(leftCG.height))
+            leftCI = leftCI.transformed(by: flipTransform)
+            finalImage = leftCI.composited(over: finalImage)
         }
         
-        // 5. Render into output CVPixelBuffer
+        // Right Panel (only draw if visible)
+        if rightW > 10.0 {
+            let rightPanel = cropAndScale(sourceImage, rect: activeCropRight, targetWidth: rightW, targetHeight: 1080)
+            
+            var processedRight = rightPanel
+            // Render right subtitle directly onto the right panel
+            if let rightCG = subtitleRenderer.render(text: rightSubtitle, width: Int(rightW)) {
+                var rightCI = CIImage(cgImage: rightCG)
+                let flipTransform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -CGFloat(rightCG.height))
+                rightCI = rightCI.transformed(by: flipTransform)
+                processedRight = rightCI.composited(over: processedRight)
+            }
+            
+            let shiftedRight = processedRight.transformed(by: CGAffineTransform(translationX: leftW, y: 0))
+            
+            // Overlay right panel over left panel
+            let composite = shiftedRight.composited(over: finalImage)
+            
+            // Draw vertical divider line
+            let dividerWidth: CGFloat = 3
+            let dividerRect = CGRect(x: leftW - dividerWidth / 2, y: 0, width: dividerWidth, height: 1080)
+            let dividerColor = CIColor(red: 1, green: 1, blue: 1, alpha: 0.4)
+            let dividerImage = CIImage(color: dividerColor).cropped(to: dividerRect)
+            
+            finalImage = dividerImage.composited(over: composite)
+        }
+        
+        // Clamp to full size
+        finalImage = finalImage.cropped(to: CGRect(x: 0, y: 0, width: 1920, height: 1080))
+        
+        // Render into output CVPixelBuffer
         guard let pool = pixelBufferPool else {
             print("[VideoCompositor] ERROR: pixelBufferPool is nil")
             return nil
@@ -157,27 +290,25 @@ class VideoCompositor: @unchecked Sendable {
         }
         
         ciContext.render(finalImage, to: outBuffer)
-        
-        // Create CGImage from finalImage for UI preview
-        guard let cgImage = ciContext.createCGImage(finalImage, from: finalImage.extent) else {
-            print("[VideoCompositor] ERROR: createCGImage failed. extent: \(finalImage.extent)")
-            return nil
-        }
-        
-        return CompositorOutput(pixelBuffer: outBuffer, cgImage: cgImage)
+        return CompositorOutput(pixelBuffer: outBuffer)
     }
 }
 
 // SubtitleRenderer handles text strip rendering via CoreText / CoreGraphics (thread-safe for background queue)
 class SubtitleRenderer: @unchecked Sendable {
     private let lock = NSLock()
-    private var cgContext: CGContext?
-    private let width = 1920
     private let height = 120
     
-    init() {
+    func render(text: String, width: Int) -> CGImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        if text.isEmpty {
+            return nil
+        }
+        
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        cgContext = CGContext(
+        guard let context = CGContext(
             data: nil,
             width: width,
             height: height,
@@ -185,21 +316,7 @@ class SubtitleRenderer: @unchecked Sendable {
             bytesPerRow: width * 4,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        )
-    }
-    
-    func render(text: String) -> CGImage? {
-        lock.lock()
-        defer { lock.unlock() }
-        
-        guard let context = cgContext else { return nil }
-        
-        // Clear context
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        
-        if text.isEmpty {
-            return nil
-        }
+        ) else { return nil }
         
         // Draw semi-transparent background
         context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.55))
@@ -210,7 +327,7 @@ class SubtitleRenderer: @unchecked Sendable {
         paragraphStyle.alignment = .center
         
         // Use CTFont instead of NSFont for thread-safe background rendering
-        let ctFont = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, 34, nil)
+        let ctFont = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, 30, nil)
         
         let attrs: [NSAttributedString.Key: Any] = [
             .font: ctFont,
@@ -231,8 +348,7 @@ class SubtitleRenderer: @unchecked Sendable {
         let framesetter = CTFramesetterCreateWithAttributedString(attributedString)
         
         // Text drawing rectangle (centered vertically)
-        // Flip the text rect since coordinate system is flipped
-        let textRect = CGRect(x: 80, y: (CGFloat(height) - 48) / 2.0, width: CGFloat(width - 160), height: 50)
+        let textRect = CGRect(x: 40, y: (CGFloat(height) - 48) / 2.0, width: CGFloat(width - 80), height: 60)
         let path = CGPath(rect: textRect, transform: nil)
         
         let frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attributedString.length), path, nil)

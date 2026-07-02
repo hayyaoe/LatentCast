@@ -28,7 +28,7 @@ class CleanFeedCoordinator: ObservableObject, @unchecked Sendable {
         }
     }
     
-    @Published var processedFrame: CGImage? = nil
+    @Published var processedFrame: SendablePixelBuffer? = nil
 }
 
 @main
@@ -65,9 +65,8 @@ struct CleanFeedView: View {
     
     var body: some View {
         Group {
-            if let cgImage = coordinator.processedFrame {
-                Image(cgImage, scale: 1.0, orientation: .up, label: Text("Clean Feed"))
-                    .resizable()
+            if let buffer = coordinator.processedFrame {
+                GPUPixelBufferView(pixelBuffer: buffer)
                     .aspectRatio(16/9, contentMode: .fit)
             } else {
                 Color.black
@@ -87,5 +86,28 @@ struct CleanFeedView: View {
             coordinator.isWindowOpen = false
             coordinator.processedFrame = nil
         }
+    }
+}
+
+struct GPUPixelBufferView: NSViewRepresentable {
+    let pixelBuffer: SendablePixelBuffer?
+    
+    func makeNSView(context: Context) -> GPUPixelBufferNSView {
+        let view = GPUPixelBufferNSView()
+        view.wantsLayer = true
+        view.layer?.contentsGravity = .resizeAspect
+        view.layer?.backgroundColor = NSColor.black.cgColor
+        return view
+    }
+    
+    func updateNSView(_ nsView: GPUPixelBufferNSView, context: Context) {
+        nsView.updateBuffer(pixelBuffer?.buffer)
+    }
+}
+
+class GPUPixelBufferNSView: NSView {
+    func updateBuffer(_ buffer: CVPixelBuffer?) {
+        // Direct GPU-to-screen composition via CoreAnimation layer content binding
+        self.layer?.contents = buffer
     }
 }

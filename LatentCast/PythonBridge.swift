@@ -73,8 +73,10 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         let text: String
         let startTime: Double
         let endTime: Double
+        let speaker: String
     }
     private var activeSubtitles: [SubtitleSegment] = []
+    private var speakerMapping: [String: String] = [:]
     
     private struct PendingSegment {
         let startTime: Double
@@ -93,13 +95,33 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
         return safeSubtitle
     }
     
-    func subtitle(for timestamp: Double) -> String {
+    func subtitle(for timestamp: Double, speaker: String) -> String {
         lock.lock()
         defer { lock.unlock() }
-        if let match = activeSubtitles.first(where: { timestamp >= ($0.startTime - 0.2) && timestamp <= ($0.endTime + 0.8) }) {
+        
+        // If speaker name is empty (full frame view), return text with speaker prefix
+        if speaker.isEmpty {
+            if let match = activeSubtitles.first(where: { timestamp >= ($0.startTime - 0.2) && timestamp <= ($0.endTime + 0.8) }) {
+                return "[\(match.speaker)]: \(match.text)"
+            }
+            return ""
+        }
+        
+        // Otherwise, return clean text for target speaker panel
+        if let match = activeSubtitles.first(where: { 
+            $0.speaker == speaker && 
+            timestamp >= ($0.startTime - 0.2) && 
+            timestamp <= ($0.endTime + 0.8) 
+        }) {
             return match.text
         }
         return ""
+    }
+    
+    func speakerLabel(for faceId: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return speakerMapping[faceId]
     }
     
     func changeWorkerConfig(modelName: String, useCPU: Bool) {
@@ -256,57 +278,56 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                     let worker = WhisperWorker(projectPath: self.projectPath, modelName: self.selectedModel, deviceType: self.useCPU ? "cpu" : "gpu")
                     worker.onTranscriptionReceived = { [weak self] rawText in
                         guard let self = self else { return }
-                        let speaker = self.dequeueSpeakerLabel()
                         
-                        let finalFullText: String
-                        var segmentsToRegister: [(text: String, start: Double, end: Double)] = []
-                        
-                        if let jsonData = rawText.data(using: .utf8),
-                           let response = try? JSONDecoder().decode(WhisperResponse.self, from: jsonData) {
-                            finalFullText = "[\(speaker)]: \(response.text)"
-                            
-                            self.lock.lock()
-                            let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
-                            self.lock.unlock()
-                            
-                            if let seg = pending {
-                                if response.segments.isEmpty {
-                                    segmentsToRegister.append((text: finalFullText, start: seg.startTime, end: seg.endTime))
-                                } else {
-                                    for subSeg in response.segments {
-                                        // Offset Whisper's relative start/end times by VAD segment start time
-                                        let absStart = seg.startTime + subSeg.start
-                                        let absEnd = seg.startTime + subSeg.end
-                                        segmentsToRegister.append((text: "[\(speaker)]: \(subSeg.text)", start: absStart, end: absEnd))
-                                    }
-                                }
-                            }
-                        } else {
-                            // Fallback to plain-text output mapping if JSON parsing fails
-                            finalFullText = "[\(speaker)]: \(rawText)"
-                            
-                            self.lock.lock()
-                            let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
-                            self.lock.unlock()
-                            
-                            if let seg = pending {
-                                segmentsToRegister.append((text: finalFullText, start: seg.startTime, end: seg.endTime))
-                            }
+                        guard let jsonData = rawText.data(using: .utf8),
+                              let response = try? JSONDecoder().decode(MultiSpeakerWhisperResponse.self, from: jsonData) else {
+                            print("[PythonBridge] Error: Failed to parse MultiSpeakerWhisperResponse from: \(rawText)")
+                            return
                         }
                         
                         self.lock.lock()
-                        self.safeSubtitle = finalFullText
-                        for item in segmentsToRegister {
-                            self.activeSubtitles.append(SubtitleSegment(text: item.text, startTime: item.start, endTime: item.end))
-                        }
-                        if self.activeSubtitles.count > 200 {
-                            self.activeSubtitles.removeFirst(self.activeSubtitles.count - 200)
-                        }
+                        let pending = self.pendingSegments.isEmpty == false ? self.pendingSegments.removeFirst() : nil
                         self.lock.unlock()
                         
-                        let textToPublish = finalFullText
-                        Task { @MainActor in
-                            self.liveTranscription = textToPublish
+                        var finalFullText = ""
+                        var segmentsToRegister: [(text: String, start: Double, end: Double, speaker: String)] = []
+                        
+                        for res in response.results {
+                            if res.text.isEmpty { continue }
+                            if finalFullText.isEmpty {
+                                finalFullText = "[\(res.speaker)]: \(res.text)"
+                            } else {
+                                finalFullText += "\n[\(res.speaker)]: \(res.text)"
+                            }
+                            
+                            if let seg = pending {
+                                if res.segments.isEmpty {
+                                    segmentsToRegister.append((text: res.text, start: seg.startTime, end: seg.endTime, speaker: res.speaker))
+                                } else {
+                                    for subSeg in res.segments {
+                                        let absStart = seg.startTime + subSeg.start
+                                        let absEnd = seg.startTime + subSeg.end
+                                        segmentsToRegister.append((text: subSeg.text, start: absStart, end: absEnd, speaker: res.speaker))
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if !finalFullText.isEmpty {
+                            self.lock.lock()
+                            self.safeSubtitle = finalFullText
+                            for item in segmentsToRegister {
+                                self.activeSubtitles.append(SubtitleSegment(text: item.text, startTime: item.start, endTime: item.end, speaker: item.speaker))
+                            }
+                            if self.activeSubtitles.count > 200 {
+                                self.activeSubtitles.removeFirst(self.activeSubtitles.count - 200)
+                            }
+                            self.lock.unlock()
+                            
+                            let textToPublish = finalFullText
+                            Task { @MainActor in
+                                self.liveTranscription = textToPublish
+                            }
                         }
                     }
                     self.whisperWorker = worker
@@ -482,16 +503,53 @@ class PythonBridge: ObservableObject, @unchecked Sendable {
                 let startTime = Double(response["start_time"]) ?? 0.0
                 let endTime = Double(response["end_time"]) ?? 0.0
                 
+                let mapping = response["speaker_mapping"]
+                if mapping != Python.None {
+                    self.lock.lock()
+                    self.speakerMapping.removeAll()
+                    for key in mapping {
+                        if let k = String(key), let v = String(mapping[key]) {
+                            self.speakerMapping[k] = v
+                        }
+                    }
+                    self.lock.unlock()
+                }
+                
+                let faceEnvelopesPython = response["face_envelopes"]
+                var faceEnvelopes: [String: [Double]] = [:]
+                if faceEnvelopesPython != Python.None {
+                    for key in faceEnvelopesPython {
+                        if let k = String(key) {
+                            var vals: [Double] = []
+                            for val in faceEnvelopesPython[key] {
+                                if let d = Double(val) {
+                                    vals.append(d)
+                                }
+                            }
+                            faceEnvelopes[k] = vals
+                        }
+                    }
+                }
+                
                 if !wavPath.isEmpty {
                     let cleanLabel = speakerLabel.isEmpty ? "Unknown Speaker" : speakerLabel
                     print("[Swift Bridge] Speech segment detected: wavPath=\(wavPath), speaker=\(cleanLabel), start=\(startTime), end=\(endTime)")
                     
                     self.lock.lock()
                     self.pendingSegments.append(PendingSegment(startTime: startTime, endTime: endTime, speaker: cleanLabel))
+                    let mappingCopy = self.speakerMapping
                     self.lock.unlock()
                     
-                    self.enqueueSpeakerLabel(cleanLabel)
-                    self.whisperWorker?.transcribe(wavPath: wavPath)
+                    let job: [String: Any] = [
+                        "wav_path": wavPath,
+                        "face_envelopes": faceEnvelopes,
+                        "speaker_mapping": mappingCopy
+                    ]
+                    
+                    if let jsonData = try? JSONSerialization.data(withJSONObject: job),
+                       let jsonString = String(data: jsonData, encoding: .utf8) {
+                        self.whisperWorker?.transcribe(jobJson: jsonString)
+                    }
                 }
                 
                 Task { @MainActor in
@@ -601,19 +659,19 @@ class WhisperWorker: @unchecked Sendable {
         }
     }
     
-    func transcribe(wavPath: String) {
+    func transcribe(jobJson: String) {
         lock.lock()
         let currentStdin = stdinPipe
         lock.unlock()
         guard let stdinPipe = currentStdin else { return }
         
-        let inputLine = wavPath + "\n"
+        let inputLine = jobJson + "\n"
         if let data = inputLine.data(using: .utf8) {
             do {
                 try stdinPipe.fileHandleForWriting.write(contentsOf: data)
-                print("[Swift-Whisper] Wrote path to worker stdin: \(wavPath)")
+                print("[Swift-Whisper] Wrote job JSON to worker stdin.")
             } catch {
-                print("[Swift-Whisper] Failed to write path to worker: \(error)")
+                print("[Swift-Whisper] Failed to write job to worker: \(error)")
             }
         }
     }
@@ -638,9 +696,14 @@ class WhisperWorker: @unchecked Sendable {
     }
 }
 
-struct WhisperResponse: Codable {
+struct MultiSpeakerWhisperResult: Codable {
+    let speaker: String
     let text: String
     let segments: [WhisperSegment]
+}
+
+struct MultiSpeakerWhisperResponse: Codable {
+    let results: [MultiSpeakerWhisperResult]
 }
 
 struct WhisperSegment: Codable {
